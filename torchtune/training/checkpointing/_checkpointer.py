@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Protocol, Union
 import torch
 import torch.distributed as dist
 from fsspec.core import url_to_fs
+import torch.distributed
 from safetensors.torch import save as save_safetensors, save_file
 from torch.distributed.checkpoint import (
     async_save,
@@ -608,6 +609,16 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
             from torchtune.models.qwen2._convert_weights import qwen2_hf_to_tune
 
             converted_state_dict[training.MODEL_KEY] = qwen2_hf_to_tune(
+                merged_state_dict,
+                num_heads=self._config["num_attention_heads"],
+                num_kv_heads=self._config["num_key_value_heads"],
+                dim=self._config["hidden_size"],
+                tie_word_embeddings=self._config["tie_word_embeddings"],
+            )
+        elif self._model_type == ModelType.QWEN2_5_VL:
+            from torchtune.models.qwen2_5_vision._convert_weights import qwen2_5_vision_hf_to_tune
+
+            converted_state_dict[training.MODEL_KEY] = qwen2_5_vision_hf_to_tune(
                 merged_state_dict,
                 num_heads=self._config["num_attention_heads"],
                 num_kv_heads=self._config["num_key_value_heads"],
