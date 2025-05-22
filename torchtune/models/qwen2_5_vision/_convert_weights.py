@@ -13,6 +13,18 @@ from torchtune.models.convert_weights import get_mapped_key
 # state dict key mappings from HF's format to torchtune's format
 _FROM_HF = {
     "model.embed_tokens.weight": "tok_embeddings.weight",
+    "visual.blocks.{}.attn.proj.bias": "", 
+    "visual.blocks.{}.attn.proj.weight": "", 
+    "visual.blocks.{}.attn.qkv.bias": "",
+    "visual.blocks.{}.attn.qkv.weight": "",
+    "visual.blocks.{}.mlp.down_proj.bias": "", 
+    "visual.blocks.{}.mlp.down_proj.weight": "", 
+    "visual.blocks.{}.mlp.gate_proj.bias": "",
+    "visual.blocks.{}.mlp.gate_proj.weight": "",
+    "visual.blocks.{}.mlp.up_proj.bias": "",
+    "visual.blocks.{}.mlp.up_proj.weight": "",
+    "visual.blocks.{}.norm1.weight": "",
+    "visual.blocks.{}.norm2.weight": "",
     "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attn.q_proj.weight",
     "model.layers.{}.self_attn.q_proj.bias": "layers.{}.attn.q_proj.bias",
     "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attn.k_proj.weight",
@@ -34,6 +46,49 @@ _FROM_HF = {
 
 QWEN2_TIED_KEY = "lm_head.weight"
 
+def qwen2_5_vision_hf_to_tune(
+    state_dict: Dict[str, torch.Tensor],
+    num_heads: int = 32,
+    num_kv_heads: int = 32,
+    dim: int = 4096,
+    head_dim: int = None,
+    tie_word_embeddings: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Convert a state dict from HF's format to TorchTune's format, which contains the weights
+    of a Qwen2 model.
+    State dicts from multiple checkpoint files should be consolidated into a single state dict
+    before calling this function.
+    The logic is identical to :func:`~torchtune.models.convert_weights.hf_to_tune`, but may not load
+    output projection weights.
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]): State dict in HF's format.
+        num_heads (int): Number of heads in the model.
+        num_kv_heads (int): Number of heads in the key/value projection layers.
+        dim (int): Dimension of the model.
+        head_dim (int): Dimension of the head. If not provided, it will be calculated
+            as dim // num_heads.
+        tie_word_embeddings (bool): Whether the model's input and output word embeddings should be tied.
+
+    Returns:
+        Dict[str, torch.Tensor]: State dict in torchtune's format.
+    """
+    converted_state_dict = {}
+    if head_dim is None:
+        head_dim = dim // num_heads
+
+    for key, value in state_dict.items():
+        if (
+            tie_word_embeddings and QWEN2_TIED_KEY in key
+        ):  # Skip loading the output projection weights
+            continue
+        if "rotary_emb.inv_freq" in key:  # Skip loading the position embeddings
+            continue
+
+        new_key = get_mapped_key(key, _FROM_HF)
+        converted_state_dict[new_key] = value
+    return converted_state_dict
 
 def qwen2_hf_to_tune(
     state_dict: Dict[str, torch.Tensor],
