@@ -49,17 +49,15 @@ def qwen2_5_vl_7b_base(
     # TODO: FINALIZE ARGS
     encoder = Qwen2_5_VisionTransformer(
         patch_size=14,
-        tile_size=image_size,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
         num_layers=32,
-        embed_dim=1280,
-        layer=...,
-        token_pos_embedding=...,
-        pre_tile_pos_embed=None,
-        post_tile_pos_embed=None,
-        cls_projection=None,
-        out_indices=[7, 15, 23, 31],
+        num_heads=16
+        embed_dim=1280, # hidden_size
+        window_size=112,
+        out_hidden_size=3584,
+        fullatt_block_indexes=[7, 15, 23, 31],
         in_channels=3,
-        append_cls_token=False,
     )
 
     return EarlyFusionModel(
