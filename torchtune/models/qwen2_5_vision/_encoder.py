@@ -39,69 +39,149 @@ class Qwen2_5_VisionMLP(nn.Module):
         x_up, _ = self.up_proj(x)
         x_down, _ = self.down_proj(x_gate * x_up)
         return x_down
-
-class Qwen2_5_VisionTransformer(nn.Module):
-    """
     
+class Qwen2_5_VisionPatchEmbed(nn.Module):
+    """
+    Patch embedding for Qwen 2.5 Vision. ZL: check if this is correct.
     """
 
     def __init__(
         self,
         patch_size: int,
-        tile_size: int,
-        num_layers: int,
+        temporal_patch_size: int,
+        in_channels: int,
         embed_dim: int,
-        layer: nn.Module,
-        token_pos_embedding: nn.Module,
-        pre_tile_pos_embed: Optional[nn.Module] = None,
-        post_tile_pos_embed: Optional[nn.Module] = None,
-        out_indices: Optional[List[int]] = None,
-        in_channels: int = 3,
-        append_cls_token: bool = False,
     ) -> None:
         super().__init__()
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
 
-        if tile_size <= 0:
-            raise ValueError("tile_size must be > 0")
-        if patch_size <= 0:
-            raise ValueError("patch_size must be > 0")
-        if out_indices and (len(out_indices) > num_layers):
-            raise ValueError(
-                f"len(out_indices) must be <= num_layers. Got {out_indices=} and {num_layers=}"
-            )
-
-        # constants
-        patch_grid_size = tile_size // patch_size
-        self.patches_per_tile = patch_grid_size**2
-        self.out_indices = out_indices
-        if not out_indices:
-            self.out_indices = []
-
-        # input modules
-        self.pre_tile_pos_embed = pre_tile_pos_embed
-        self.post_tile_pos_embed = post_tile_pos_embed
-        self.token_pos_embedding = token_pos_embedding
-
-        self.layers = _get_clones(layer, num_layers)
-
-        # other modules
-        self.conv = nn.Conv3d( #TODO: CHECK ARGS
+        kernel_size = (temporal_patch_size, patch_size, patch_size)
+        self.proj = nn.Conv3d(
             in_channels=in_channels,
             out_channels=embed_dim,
-            kernel_size=(patch_size, patch_size, patch_size),
-            stride=(patch_size, patch_size, patch_size),
+            kernel_size=kernel_size,
+            stride=kernel_size,
             bias=False,
         )
 
-        self.ln_post = Fp32LayerNorm(embed_dim)
-        self.ln_pre = Fp32LayerNorm(embed_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Todo ZL: check if this is correct
+        return self.conv(x)
 
-        self.cls_token_embedding = CLSEmbedding(
-            embed_dim, append_cls_token=append_cls_token
+       
+class Qwen2_5_VisionRotaryEmbedding(nn.Module):
+    """
+    Rotary embedding for Qwen 2.5 Vision. ZL: check if this is correct.
+    """
+
+    def __init__(self, head_dim: int) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pass
+
+class Qwen2_5_VLVisionBlock(nn.Module):
+    """
+    Vision block for Qwen 2.5 Vision. ZL: check if this is correct.
+    """
+
+    def __init__(
+        self,
+        config: nn.Module,
+        attn_implementation: Callable,
+    ) -> None:
+        super().__init__()
+        self.attn = attn_implementation(config)
+        self.mlp = Qwen2_5_VisionMLP(
+            gate_proj=nn.Linear(config.hidden_size, config.intermediate_size),
+            down_proj=nn.Linear(config.intermediate_size, config.hidden_size),
+            up_proj=nn.Linear(config.hidden_size, config.intermediate_size),
+            activation=nn.SiLU(),
+        )
+        self.norm1 = Fp32LayerNorm(config.hidden_size)
+        self.norm2 = Fp32LayerNorm(config.hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.attn(x)
+        x = self.mlp(x)
+        return x
+
+class Qwen2_5_VLPatchMerger(nn.Module):
+    """
+    Patch merger for Qwen 2.5 Vision. ZL: check if this is correct.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int,
+        spatial_merge_size: int,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.context_dim = context_dim
+        self.spatial_merge_size = spatial_merge_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pass
+
+class Qwen2_5_VisionTransformer(nn.Module):
+    """
+    Qwen2_5_VisionTransformer ZL: check if this is correct.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        temporal_patch_size: int,
+        spatial_merge_size: int,
+        num_layers: int,
+        num_heads: int,
+        embed_dim: int, # hidden_size
+        window_size: int,
+        out_hidden_size: int,
+        fullatt_block_indexes: List[int],
+        in_channels: int = 3,
+    ) -> None:
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.spatial_merge_size = spatial_merge_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim # hidden_size
+        self.window_size = window_size
+        self.out_hidden_size = out_hidden_size
+        self.fullatt_block_indexes = fullatt_block_indexes
+        self.in_channels = in_channels
+    
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+        _attn_implementation = 'sdpa' # TODO: implement this ZL
+        
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=self.patch_size,
+            temporal_patch_size=self.temporal_patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.embed_dim,
         )
 
-    def get_image_tokens_per_tile(self):
-        return self.patches_per_tile + 1  # +1 for CLS token
+        head_dim = self.embed_dim // self.num_heads
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.layers = nn.ModuleList(
+            [Qwen2_5_VLVisionBlock(self.embed_dim, self.num_heads, _attn_implementation) for _ in range(self.num_layers)]
+        )
+
+        self.merger = Qwen2_5_VLPatchMerger(
+            dim = self.out_hidden_size,
+            context_dim = self.hidden_size,
+            spatial_merge_size = self.spatial_merge_size,
+        )
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -256,159 +336,5 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return x, hidden_states
 
 
-class CLSEmbedding(nn.Module):
-    """
-    Adds a CLS token to every tile in an image.
 
-    Notice that tile is different from patch (token). An image is divided into tiles during pre-processing,
-    and patches are the outcome of the convolution in the ViT applied to each tile.
-
-    Args:
-        embed_dim (int): The dimensionality of the input patch embedding.
-        append_cls_token (bool): If True, adds CLS token to the end of the sequence.
-            Default is False, which adds CLS token to the beginning of the sequence.
-    """
-
-    def __init__(self, embed_dim: int, append_cls_token: bool = False) -> None:
-        super().__init__()
-
-        scale = embed_dim**-0.5
-        self.weight = nn.Parameter(scale * torch.randn(embed_dim))
-        self.append_cls_token = append_cls_token
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        # add 1 CLS token to every tile
-        bsz_and_n_imgs, n_tiles, n_tokens, embed_dim = x.shape
-        cls_emb = self.weight.broadcast_to(bsz_and_n_imgs, n_tiles, 1, embed_dim)
-        return (
-            torch.cat([x, cls_emb], dim=2)
-            if self.append_cls_token
-            else torch.cat([cls_emb, x], dim=2)
-        )
-
-
-
-
-class Qwen2_5VisionProjectionHead(nn.Module):
-    """Projection transformer to adapt the output of a
-    pretrained frozen encoder (CLIP) to a pretrained decoder model.
-    For example, ``nn.Sequential(CLIP(), Qwen2_5VisionProjectionHead())``.
-
-    Note: this module assumes the CLS token embedding is added at the end
-    of the sequence.
-
-    Args:
-        output (nn.Module): output layer, typically an MLP.
-        pixel_shuffle_scaling_factor (float): scaling factor for pixel shuffle.
-    """
-
-    def __init__(
-        self,
-        output: nn.Module,
-        pixel_shuffle_scaling_factor: float = 0.5,
-    ) -> None:
-        super().__init__()
-        self.output = output
-        self.pixel_shuffle_scaling_factor = pixel_shuffle_scaling_factor
-
-    def _pixel_shuffle(self, x: torch.Tensor) -> torch.Tensor:
-        n, w, h, c = x.size()
-        x = x.view(
-            n,
-            w,
-            int(h * self.pixel_shuffle_scaling_factor),
-            int(c / self.pixel_shuffle_scaling_factor),
-        )
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(
-            n,
-            int(h * self.pixel_shuffle_scaling_factor),
-            int(w * self.pixel_shuffle_scaling_factor),
-            int(
-                c
-                / (
-                    self.pixel_shuffle_scaling_factor
-                    * self.pixel_shuffle_scaling_factor
-                )
-            ),
-        )
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape [b, e, d]
-
-        Returns:
-            Tensor: output tensor of a sequence of embeddings [b, s, d * pixel_shuffle_factor ** 2]
-
-        Notation used for tensor shapes:
-            - b: batch size
-            - e: number of embeds per tile (e.g. CLS embed + patch embeds, etc.)
-            - s: sequence length computed by t * (e - 1) // (pixel_shuffle_factor ** 2)
-            - d: embed dim
-        """
-        # Remove cls token - assumes it is the last token in the sequence
-        x = x[:, :-1, :] # TODO: Remove?
-        bsz, embeds, dim = x.shape
-
-        # apply pixel shuffle
-        h_patches = w_patches = int(embeds**0.5)
-        x = x.reshape(bsz, h_patches, w_patches, -1)
-        x = self._pixel_shuffle(x)
-        _, new_h_patches, new_w_patches, new_dim = x.shape
-        # shape: [bsz, embeds // factor ** 2, dim * factor ** 2)]
-        x = x.reshape(bsz, new_h_patches * new_w_patches, new_dim)
-        # apply output - shape [bsz, embeds // factor ** 2, output_dim]
-        x = self.output(x)
-
-        return x
-
-
-
-class Qwen2_5VisionEncoder(nn.Module):
-    """Vision encoder model for Qwen 2.5. This combines a pretrained
-    vision encoder with a learnable projection head. The projection head
-    is converted to a fusion module and supports fusion utils.
-
-    Args:
-        visual_encoder (nn.Module): Qwen2_5_VisionTransformer model
-        projection_head (nn.Module): ``projection_head`` that takes embeddings
-            with dimension ``encoder_dim`` as input and outputs embeddings of
-            size ``decoder_dim``. See :func:`torchtune.models.qwen2_5_vision.qwen2_5_vision_projection_head`
-            as an example.
-    """
-
-    def __init__(self, visual_encoder: nn.Module, projection_head: nn.Module) -> None:
-        super().__init__()
-        self.visual_encoder = visual_encoder
-        self.projection = projection_head
-        register_fusion_module(self.projection)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images (torch.Tensor): Image tensor with shape [b x c x w x h]
-
-        Returns:
-            Tensor: output tensor of a sequence of embeddings ``[b x s x d]``
-                where sequence length (``s``) is ``(num_imgs*num_tiles)+num_embeds``
-
-         Notation used for tensor shapes:
-            - b: batch size, equal to flatten(batch x images x tiles)
-            - c: number of image channels (e.g. rgb = 3)
-            - w: image width
-            - h: image height
-            - s: sequence length computed by i*t*clip_embeds_per_tile
-            - d: embed dim
-        """
-        #TODO: check dims
-        x, _ = self.visual_encoder(images[:, None, None])
-        x = self.projection(x.squeeze((1, 2)))
-        return x
 
