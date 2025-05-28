@@ -52,17 +52,18 @@ def qwen2_5_vl_7b_base(
         temporal_patch_size=2,
         spatial_merge_size=2,
         num_layers=32,
-        num_heads=16
+        num_heads=16,
         embed_dim=1280, # hidden_size
         window_size=112,
         out_hidden_size=3584,
+        intermediate_dim=3420,
         fullatt_block_indexes=[7, 15, 23, 31],
         in_channels=3,
     )
 
     return EarlyFusionModel(
         decoder = decoder,
-        encoder = {"vision": encoder},
+        encoders = {"vision": encoder},
         encoder_tokens={
             "vision": QWEN2_5_SPECIAL_TOKENS["<|patch|>"], #TODO: do we need to introduce a new token?
         },
