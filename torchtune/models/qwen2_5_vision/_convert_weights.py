@@ -10,36 +10,40 @@ import torch
 
 from torchtune.models.convert_weights import get_mapped_key
 
-# state dict key mappings from HF's format to torchtune's format
+# state dict key mappings from HF's format to torchtune's format key from checkpoint, value from model
 _FROM_HF = {
-    "model.embed_tokens.weight": "tok_embeddings.weight",
-    "visual.blocks.{}.attn.proj.bias": "", 
-    "visual.blocks.{}.attn.proj.weight": "", 
-    "visual.blocks.{}.attn.qkv.bias": "",
-    "visual.blocks.{}.attn.qkv.weight": "",
-    "visual.blocks.{}.mlp.down_proj.bias": "", 
-    "visual.blocks.{}.mlp.down_proj.weight": "", 
-    "visual.blocks.{}.mlp.gate_proj.bias": "",
-    "visual.blocks.{}.mlp.gate_proj.weight": "",
-    "visual.blocks.{}.mlp.up_proj.bias": "",
-    "visual.blocks.{}.mlp.up_proj.weight": "",
-    "visual.blocks.{}.norm1.weight": "",
-    "visual.blocks.{}.norm2.weight": "",
-    "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attn.q_proj.weight",
-    "model.layers.{}.self_attn.q_proj.bias": "layers.{}.attn.q_proj.bias",
-    "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attn.k_proj.weight",
-    "model.layers.{}.self_attn.k_proj.bias": "layers.{}.attn.k_proj.bias",
-    "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attn.v_proj.weight",
-    "model.layers.{}.self_attn.v_proj.bias": "layers.{}.attn.v_proj.bias",
-    "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attn.output_proj.weight",
+    "visual.patch_embed.proj.weight":"encoders.vision.patch_embed.proj.weight",
+    "visual.blocks.{}.attn.proj.bias": "encoders.vision.layers.{}.attn.proj.bias", 
+    "visual.blocks.{}.attn.proj.weight": "encoders.vision.layers.{}.attn.proj.weight", 
+    "visual.blocks.{}.attn.qkv.bias": "encoders.vision.layers.{}.attn.qkv.bias",
+    "visual.blocks.{}.attn.qkv.weight": "encoders.vision.layers.{}.attn.qkv.weight",
+    "visual.blocks.{}.mlp.down_proj.bias": "encoders.vision.layers.{}.mlp.down_proj.bias", 
+    "visual.blocks.{}.mlp.down_proj.weight": "encoders.vision.layers.{}.mlp.down_proj.weight", 
+    "visual.blocks.{}.mlp.gate_proj.bias": "encoders.vision.layers.{}.mlp.gate_proj.bias",
+    "visual.blocks.{}.mlp.gate_proj.weight": "encoders.vision.layers.{}.mlp.gate_proj.weight",
+    "visual.blocks.{}.mlp.up_proj.bias": "encoders.vision.layers.{}.mlp.up_proj.bias",
+    "visual.blocks.{}.mlp.up_proj.weight": "encoders.vision.layers.{}.mlp.up_proj.weight",
+    "visual.blocks.{}.norm1.weight": "encoders.vision.layers.{}.norm1.weight",
+    "visual.blocks.{}.norm2.weight": "encoders.vision.layers.{}.norm2.weight",
+    "visual.merger.ln_q.weight": "encoders.vision.merger.ln_q.weight",
+    "visual.merger.mlp.{}.weight": "encoders.vision.merger.mlp.{}.weight",
+    "visual.merger.mlp.{}.bias": "encoders.vision.merger.mlp.{}.bias",
+    "model.embed_tokens.weight": "decoder.tok_embeddings.weight",
+    "model.layers.{}.self_attn.q_proj.weight": "decoder.layers.{}.attn.q_proj.weight",
+    "model.layers.{}.self_attn.q_proj.bias": "decoder.layers.{}.attn.q_proj.bias",
+    "model.layers.{}.self_attn.k_proj.weight": "decoder.layers.{}.attn.k_proj.weight",
+    "model.layers.{}.self_attn.k_proj.bias": "decoder.layers.{}.attn.k_proj.bias",
+    "model.layers.{}.self_attn.v_proj.weight": "decoder.layers.{}.attn.v_proj.weight",
+    "model.layers.{}.self_attn.v_proj.bias": "decoder.layers.{}.attn.v_proj.bias",
+    "model.layers.{}.self_attn.o_proj.weight": "decoder.layers.{}.attn.output_proj.weight",
     "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
-    "model.layers.{}.mlp.gate_proj.weight": "layers.{}.mlp.w1.weight",
-    "model.layers.{}.mlp.up_proj.weight": "layers.{}.mlp.w3.weight",
-    "model.layers.{}.mlp.down_proj.weight": "layers.{}.mlp.w2.weight",
-    "model.layers.{}.input_layernorm.weight": "layers.{}.sa_norm.scale",
-    "model.layers.{}.post_attention_layernorm.weight": "layers.{}.mlp_norm.scale",
-    "model.norm.weight": "norm.scale",
-    "lm_head.weight": "output.weight",
+    "model.layers.{}.mlp.gate_proj.weight": "decoder.layers.{}.mlp.w1.weight",
+    "model.layers.{}.mlp.up_proj.weight": "decoder.layers.{}.mlp.w3.weight",
+    "model.layers.{}.mlp.down_proj.weight": "decoder.layers.{}.mlp.w2.weight",
+    "model.layers.{}.input_layernorm.weight": "decoder.layers.{}.sa_norm.scale",
+    "model.layers.{}.post_attention_layernorm.weight": "decoder.layers.{}.mlp_norm.scale",
+    "model.norm.weight": "decoder.norm.scale",
+    "lm_head.weight": "decoder.output.weight",
     # TODO: Add vision weights
 }
 
@@ -87,6 +91,7 @@ def qwen2_5_vision_hf_to_tune(
             continue
 
         new_key = get_mapped_key(key, _FROM_HF)
+        #new_key = key
         converted_state_dict[new_key] = value
     return converted_state_dict
 
