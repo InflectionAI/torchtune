@@ -35,7 +35,7 @@ shuffle: True
 
 # Model Arguments
 model:
-  _component_: torchtune.models.qwen2_5.qwen2_5_7b_instruct
+  _component_: torchtune.models.qwen2_5_vision.qwen2_5_vl_7b_base
 
 checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
