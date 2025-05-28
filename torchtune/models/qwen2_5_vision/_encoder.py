@@ -76,8 +76,8 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.head_dim = head_dim
-        inv_freq = 1.0 / (theta ** (torch.arange(0, self._head_dim, 2, dtype=torch.float) / self.head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float) / self.head_dim))
+        #self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
@@ -101,6 +101,9 @@ class Qwen2RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 class QWEN2_5_VL_VISION_ATTENTION_CLASSES:
     """
@@ -225,12 +228,13 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         self,
         hidden_size: int,
         num_heads: int,
+        intermediate_size: int,
         attn_implementation: str = 'sdpa',  # TODO: implement this ZL
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.intermediate_size = hidden_size * 4  # Verify: Assuming a common intermediate size
+        self.intermediate_size = intermediate_size  # Verify: Assuming a common intermediate size
         self.norm1 = Qwen2RMSNorm(self.hidden_size, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(self.hidden_size, eps=1e-6)
         self.attn = QWEN2_5_VL_VISION_ATTENTION_CLASSES[attn_implementation](
@@ -295,6 +299,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         embed_dim: int, # hidden_size
         window_size: int,
         out_hidden_size: int,
+        intermediate_dim: int,
         fullatt_block_indexes: List[int],
         in_channels: int = 3,
     ) -> None:
@@ -308,6 +313,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.embed_dim = embed_dim # hidden_size
         self.window_size = window_size
         self.out_hidden_size = out_hidden_size
+        self.intermediate_dim = intermediate_dim
         self.fullatt_block_indexes = fullatt_block_indexes
         self.in_channels = in_channels
     
@@ -324,12 +330,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         head_dim = self.embed_dim // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
         self.layers = nn.ModuleList(
-            [Qwen2_5_VLVisionBlock(self.embed_dim, self.num_heads, _attn_implementation) for _ in range(self.num_layers)]
+            [Qwen2_5_VLVisionBlock(self.embed_dim, self.num_heads, self.intermediate_dim, _attn_implementation) for _ in range(self.num_layers)]
         )
 
         self.merger = Qwen2_5_VLPatchMerger(
             dim = self.out_hidden_size,
-            context_dim = self.hidden_size,
+            context_dim = self.embed_dim,
             spatial_merge_size = self.spatial_merge_size,
         )
         self.gradient_checkpointing = False
