@@ -36,6 +36,7 @@ QWEN2_5_SPECIAL_TOKENS = {
     "<|fim_pad|>": 151662,
     "<|repo_name|>": 151663,
     "<|file_sep|>": 151664,
+    "<|patch|>": 151665, # TODO: ZL need to update
 }
 
 
