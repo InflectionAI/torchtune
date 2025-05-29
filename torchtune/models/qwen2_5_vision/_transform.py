@@ -97,6 +97,8 @@ class Qwen25VisionTransform(ModelTokenizer, Transform):
             max_seq_len=max_seq_len,
             prompt_template=template,
         )
+
+
         
         self.thumbnail_transform = v2.Compose(
             [
@@ -215,7 +217,47 @@ class Qwen25VisionTransform(ModelTokenizer, Transform):
         Apply image decoding, transformations and tokenization to messages in the sample.
 
         Args:
-            sample (Mapping[str, Any]): A sample with a "messages" field.
+            sample (Mapping[str, Any]): A sample with a "messages" field. The example of sample
+            {
+            "messages": [
+                {
+                "role": "user",
+                "content": [
+                    "<PIL.JpegImagePlugin.JpegImageFile image mode=RGB size=333x500 at 0x7DCCE35345E0>",
+                    "Who wrote this book?\nKeep it short and to the point."
+                ]
+                },
+                {
+                "role": "assistant",
+                "content": ["Thomas R. Schreiner."]
+                },
+                {
+                "role": "user",
+                "content": ["What is the title of this book?\nProvide a short and direct response."]
+                },
+                {
+                "role": "assistant",
+                "content": ["New Testament Theology: Magnifying God in Christ."]
+                },
+                {
+                "role": "user",
+                "content": ["What is the genre of this book?\nYour response must be concise."]
+                },
+                {
+                "role": "assistant",
+                "content": ["Christian Books & Bibles."]
+                },
+                {
+                "role": "user",
+                "content": ["Is this christianity book?\nYour answer should be compact."]
+                },
+                {
+                "role": "assistant",
+                "content": ["Yes."]
+                }
+            ]
+            }
+
             inference (bool): Whether to run in inference mode. Default is False.
 
         Returns:
@@ -225,13 +267,16 @@ class Qwen25VisionTransform(ModelTokenizer, Transform):
                 - encoder_input: Dict[str, Any] of transformed images
         """
         #encoder_input = {"vision": {"images": []}}
-        print(f"_transformer.py __call__ function")
+        print(f"_transformer.py __call__ function sample: {sample}")
         encoder_input = {"images": [], "aspect_ratio": []}
         messages = sample["messages"]
         for message in messages:
             for content in message.content:
+                #print(f"_transformer.py: content: {content}")
+                
                 if content["type"] == "image":
                     image = content["content"]
+                    print(f"_transformer.py image: {image}")
                     tiles, ar = self.transform_image(image, inference=inference)
                     #encoder_input["vision"]["images"].append(tiles)
                     encoder_input["images"].append(tiles)
@@ -240,7 +285,7 @@ class Qwen25VisionTransform(ModelTokenizer, Transform):
                     # so tokenizer can add the corresponding special tokens
                     #content["patch_tokens_per_tile"] = self.patch_tokens_per_tile
                     #content["aspect_ratio"] = ar
-
+                
         sample["encoder_input"] = encoder_input
         sample = self.tokenizer(sample, inference=inference)
         return sample
