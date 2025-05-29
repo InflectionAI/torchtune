@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple, Callable
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
     
@@ -76,7 +77,7 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.head_dim = head_dim
-        inv_freq = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float) / self.head_dim))
+        self.inv_freq = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float) / self.head_dim))
         #self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
@@ -455,7 +456,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        for layer_num, blk in enumerate(self.blocks):
+        for layer_num, blk in enumerate(self.layers):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
