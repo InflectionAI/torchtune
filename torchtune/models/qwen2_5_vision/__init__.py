@@ -8,6 +8,9 @@ from ._model_builders import (
     qwen2_5_vl_7b_base,
 )
 
+from ._transform import Qwen25VisionTransform
+
 __all__ = [
     "qwen2_5_vl_7b_base",
+    "Qwen25VisionTransform",
 ]

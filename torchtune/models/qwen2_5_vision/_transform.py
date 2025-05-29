@@ -11,16 +11,19 @@ import torch
 import torchvision.transforms.v2 as v2
 from PIL import Image
 
-from torchtune.data.message import Message
-from torchtune.data.templates import _TemplateType, _get_prompt_template
+from torchtune.data import Message
+from torchtune.data._prompt_templates import _TemplateType, _get_prompt_template
 from torchtune.models.clip._transform import CLIPImageTransform
-from torchtune.models.qwen2_5._tokenizer import Qwen2_5Tokenizer
-from torchtune.tokenizers.utils import parse_hf_tokenizer_json
+from ._tokenizer import Qwen2_5Tokenizer
+from ._tokenizer import QWEN2_5_SPECIAL_TOKENS
+from torchtune.modules.transforms import Transform
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
+from torchtune.modules.tokenizers import parse_hf_tokenizer_json
 
 logger = logging.getLogger(__name__)
 
 
-class Qwen25VisionTransform:
+class Qwen25VisionTransform(ModelTokenizer, Transform):
     """
     Transform for Qwen 2.5 Vision model that handles both text tokenization and image processing.
 
@@ -57,6 +60,7 @@ class Qwen25VisionTransform:
     def __init__(
         self,
         path: str,
+        merges_file: str,
         *,
         tile_size: int,
         patch_size: int,
@@ -64,16 +68,23 @@ class Qwen25VisionTransform:
         pixel_shuffle_scaling_factor: float = 0.5,
         special_tokens_path: Optional[str] = None,
         max_seq_len: Optional[int] = None,
-        image_mean: Optional[List[float]] = None,
-        image_std: Optional[List[float]] = None,
+        # image_mean: Optional[List[float]] = None,
+        image_mean: Optional[List[float]] = [0.48145466,0.4578275,0.40821073],
+        #image_std: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = [0.26862954,0.26130258,0.27577711],
         dtype: torch.dtype = torch.bfloat16,
         prompt_template: Optional[_TemplateType] = None,
-    ):
-        special_tokens = (
-            parse_hf_tokenizer_json(special_tokens_path)
-            if special_tokens_path is not None
-            else None
-        )
+    ):  
+        print(f"qwen2.5_vision _transform.py special_tokens_path: {special_tokens_path}")
+        if special_tokens_path:
+            special_tokens = (
+                parse_hf_tokenizer_json(special_tokens_path)
+                if special_tokens_path is not None
+                else None
+            )
+        else:
+            special_tokens = QWEN2_5_SPECIAL_TOKENS
+
         template = (
             _get_prompt_template(prompt_template)
             if prompt_template is not None
@@ -81,10 +92,12 @@ class Qwen25VisionTransform:
         )
         self.tokenizer = Qwen2_5Tokenizer(
             path=path,
+            merges_file=merges_file,
             special_tokens=special_tokens,
             max_seq_len=max_seq_len,
             prompt_template=template,
         )
+        
         self.thumbnail_transform = v2.Compose(
             [
                 v2.Resize((tile_size, tile_size)),
@@ -211,19 +224,22 @@ class Qwen25VisionTransform:
                 - mask: List[bool] of masks for the tokenized messages
                 - encoder_input: Dict[str, Any] of transformed images
         """
-        encoder_input = {"vision": {"images": []}}
+        #encoder_input = {"vision": {"images": []}}
+        print(f"_transformer.py __call__ function")
+        encoder_input = {"images": [], "aspect_ratio": []}
         messages = sample["messages"]
         for message in messages:
             for content in message.content:
                 if content["type"] == "image":
                     image = content["content"]
                     tiles, ar = self.transform_image(image, inference=inference)
-                    encoder_input["vision"]["images"].append(tiles)
-
+                    #encoder_input["vision"]["images"].append(tiles)
+                    encoder_input["images"].append(tiles)
+                    encoder_input["aspect_ratio"].append(ar)
                     # Add number of patch tokens, tiles, and aspect ratio to metadata
                     # so tokenizer can add the corresponding special tokens
-                    content["patch_tokens_per_tile"] = self.patch_tokens_per_tile
-                    content["aspect_ratio"] = ar
+                    #content["patch_tokens_per_tile"] = self.patch_tokens_per_tile
+                    #content["aspect_ratio"] = ar
 
         sample["encoder_input"] = encoder_input
         sample = self.tokenizer(sample, inference=inference)
