@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List
 
 import torch
 from torch import nn
@@ -817,11 +817,14 @@ class MedusaTransformerDecoder(TransformerDecoder):
             main_output = self.output(h_norm).float()
         
         # Medusa head outputs
-        medusa_outputs = []
-        for medusa_head in self.medusa_prediction_heads:
-            # shape: [b, seq_len, vocab_size]
-            medusa_out = medusa_head(h_norm).float()
-            medusa_outputs.append(medusa_out)
+        if self.num_output_chunks > 0:
+            medusa_outputs = self.chunked_medusa_output(h_norm)
+        else:
+            medusa_outputs = []
+            for medusa_head in self.medusa_heads:
+                # shape: [b, seq_len, vocab_size]
+                medusa_out = medusa_head(h_norm).float()
+                medusa_outputs.append(medusa_out)
         
         # Combine outputs
         all_outputs = [main_output] + medusa_outputs
@@ -833,3 +836,42 @@ class MedusaTransformerDecoder(TransformerDecoder):
             output = all_outputs
             
         return output
+
+    @torch.compiler.disable
+    def chunked_medusa_output(self, last_hidden_state: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Apply medusa head projections in chunks for memory efficiency.
+        
+        This method splits the hidden state into chunks and applies each medusa head
+        to each chunk separately, similar to the main chunked_output method.
+        
+        Args:
+            last_hidden_state (torch.Tensor): last hidden state of the decoder, having shape
+                [b, seq_len, embed_dim].
+
+        Returns:
+            List[torch.Tensor]: List of medusa head outputs. Each element is either:
+                - A single tensor [b, seq_len, vocab_size] if num_output_chunks == 0
+                - A list of chunk tensors if num_output_chunks > 0
+        """
+        medusa_outputs = []
+        
+        # Split hidden state into chunks
+        hidden_chunks = last_hidden_state.chunk(self.num_output_chunks, dim=1)
+        
+        # Apply each medusa head to all chunks
+        for medusa_head in self.medusa_heads:
+            # Apply this medusa head to each chunk
+            head_chunks = []
+            for chunk in hidden_chunks:
+                chunk_output = medusa_head(chunk).float()
+                head_chunks.append(chunk_output)
+            
+            # If chunked output is being used, return list of chunks
+            # Otherwise concatenate chunks back together
+            if len(head_chunks) == 1:
+                medusa_outputs.append(head_chunks[0])
+            else:
+                medusa_outputs.append(head_chunks)
+        
+        return medusa_outputs
