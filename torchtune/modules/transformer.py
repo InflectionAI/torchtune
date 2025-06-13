@@ -745,7 +745,7 @@ class MedusaTransformerDecoder(TransformerDecoder):
         hidden_size = self.tok_embeddings.embedding_dim
         
         # Create Medusa prediction heads - each is a linear layer from hidden_dim to vocab_size
-        self.medusa_prediction_heads = nn.ModuleList(
+        self.medusa_heads = nn.ModuleList(
         [
             nn.Sequential(
                 *([ResBlock(hidden_size)]),
@@ -754,6 +754,19 @@ class MedusaTransformerDecoder(TransformerDecoder):
             for _ in range(self.medusa_num_heads)
         ]
     )
+
+    def _freeze_body_weights(self):
+        """
+        Freeze all parameters in the model except for the medusa prediction heads.
+        This ensures only the medusa heads are trained while keeping the base model frozen.
+        
+        Args:
+            model (MedusaTransformerDecoder): The medusa model to freeze
+        """
+        for param in self.parameters():
+            param.requires_grad = False
+        for param in self.medusa_heads.parameters():
+            param.requires_grad = True
 
     def forward(self, tokens: torch.Tensor, *, mask: Optional[_MaskType] = None, encoder_input: Optional[torch.Tensor] = None, encoder_mask: Optional[torch.Tensor] = None, input_pos: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
         """

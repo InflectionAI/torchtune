@@ -45,6 +45,7 @@ from torchtune.training.quantization import (
     convert_to_float8_training,
     is_fp8_tensorwise_scaling,
 )
+from torchtune.modules import MedusaTransformerDecoder
 
 from tqdm import tqdm
 
@@ -697,6 +698,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             cpu_offload=fsdp_cpu_offload,
         )
 
+        # Freeze body weights for MedusaTransformerDecoder - only train medusa heads
+        if isinstance(model, MedusaTransformerDecoder):
+            self._freeze_body_weights(model)
+
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading, activation_offloading_use_streams
@@ -718,6 +723,34 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         torch.distributed.barrier(device_ids=[self._device.index])
 
         return model
+
+    def _freeze_body_weights(self, model: MedusaTransformerDecoder) -> None:
+        """
+        Freeze all parameters in the model except for the medusa prediction heads.
+        This ensures only the medusa heads are trained while keeping the base model frozen.
+        
+        Args:
+            model (MedusaTransformerDecoder): The medusa model to freeze
+        """
+        # First, freeze all parameters
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Then, unfreeze only the medusa prediction heads
+        for medusa_head in model.medusa_heads:
+            for param in medusa_head.parameters():
+                param.requires_grad = True
+
+        # Count trainable parameters for logging
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+
+        utils.log_rank_zero(
+            self._logger,
+            f"Frozen body weights for MedusaTransformerDecoder. "
+            f"Training {trainable_params:,} out of {total_params:,} parameters "
+            f"({trainable_params/total_params*100:.2f}%)"
+        )
 
     def _setup_optimizer(
         self,

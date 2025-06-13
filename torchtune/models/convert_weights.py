@@ -157,7 +157,8 @@ def hf_to_tune(
         )
 
     for key, value in state_dict.items():
-        if "rotary_emb.inv_freq" not in key:  # Skip loading the position embeddings
+        # Skip loading position embeddings and medusa head weights (HF models don't have medusa heads)
+        if "rotary_emb.inv_freq" not in key and "medusa_heads" not in key:
             new_key = get_mapped_key(key, _FROM_HF)
             if "q_proj" in key:
                 value = _permute(value, num_heads)
@@ -204,12 +205,16 @@ def tune_to_hf(
         )
 
     for key, value in state_dict.items():
-        new_key = get_mapped_key(key, inverted_mapping_dict)
-        if "q_proj" in key:
-            value = _permute(value, num_heads)
-        elif "k_proj" in key:
-            value = _permute(value, num_kv_heads)
-        converted_state_dict[new_key] = value
+        # Handle medusa head weights separately - keep them as-is for saving
+        if "medusa_heads" in key:
+            converted_state_dict[key] = value
+        else:
+            new_key = get_mapped_key(key, inverted_mapping_dict)
+            if "q_proj" in key:
+                value = _permute(value, num_heads)
+            elif "k_proj" in key:
+                value = _permute(value, num_kv_heads)
+            converted_state_dict[new_key] = value
 
     return converted_state_dict
 
