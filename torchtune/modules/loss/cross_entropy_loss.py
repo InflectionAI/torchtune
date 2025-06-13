@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
+from typing import Optional, Union
 
 from torchtune.modules.loss.loss_types import SFTLoss
 from torchtune.utils import get_logger
@@ -143,3 +144,234 @@ class LinearCrossEntropyLoss(nn.Module, SFTLoss):
             return total_loss
         else:
             return total_loss / total_elements
+
+class WeightedCrossEntropyLoss(nn.Module, SFTLoss):
+    """
+    Weighted Cross-entropy loss for Medusa multi-token prediction heads.
+    
+    This loss function handles multiple prediction heads from MedusaTransformerDecoder,
+    where each head predicts k-th next tokens. The loss applies different weights
+    to different prediction heads, typically with decreasing weights for further predictions.
+    
+    Args:
+        num_medusa_heads (int): Number of Medusa prediction heads. Default is 4.
+        medusa_weights (list[float], optional): Weights for each Medusa head. If None,
+            uses exponentially decreasing weights: [1.0, 0.5, 0.25, 0.125, ...]
+        main_head_weight (float): Weight for the main LM head. Default is 1.0.
+        ignore_index (int): Index to ignore in the target tensor. Default is -100.
+        num_output_chunks (int): Number of chunks to split the output tensor into for memory efficiency. Default is 8.
+    """
+    
+    def __init__(
+        self,
+        num_medusa_heads: int = 4,
+        medusa_weights: Optional[list[float]] = None,
+        main_head_weight: float = 0.0,
+        ignore_index: int = -100,
+        num_output_chunks: int = 8,
+    ):
+        super().__init__()
+        self.num_medusa_heads = num_medusa_heads
+        self.main_head_weight = main_head_weight
+        self.ignore_index = ignore_index
+        self.num_output_chunks = num_output_chunks
+        
+        # Set default exponentially decreasing weights if not provided
+        if medusa_weights is None:
+            self.medusa_weights = [1.0 / (2 ** i) for i in range(num_medusa_heads)]
+        else:
+            if len(medusa_weights) != num_medusa_heads:
+                raise ValueError(f"medusa_weights length ({len(medusa_weights)}) must match num_medusa_heads ({num_medusa_heads})")
+            self.medusa_weights = medusa_weights
+        
+        log.info(f"WeightedCrossEntropyLoss initialized with main_head_weight: {main_head_weight}, medusa_weights: {self.medusa_weights}")
+
+    def compute_cross_entropy_chunk(
+        self,
+        logits_chunk: torch.Tensor,
+        target_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Computes cross-entropy loss for a single chunk of logits and targets.
+        
+        Args:
+            logits_chunk (torch.Tensor): [batch_size, chunk_size, vocab_size]
+            target_chunk (torch.Tensor): [batch_size, chunk_size]
+            
+        Returns:
+            torch.Tensor: Sum of cross-entropy loss for non-ignored tokens in the chunk
+        """
+        # Flatten logits and targets
+        logits_flat = logits_chunk.view(-1, logits_chunk.size(-1))  # [batch_size * chunk_size, vocab_size]
+        target_flat = target_chunk.view(-1)  # [batch_size * chunk_size]
+        
+        # Compute cross-entropy loss
+        return F.cross_entropy(
+            logits_flat.float(),
+            target_flat,
+            reduction="sum",
+            ignore_index=self.ignore_index,
+        )
+
+    def forward(
+        self,
+        outputs: Union[torch.Tensor, list[torch.Tensor]],
+        targets: dict[str, Union[torch.Tensor, list[torch.Tensor]]],
+    ) -> torch.Tensor:
+        """
+        Computes weighted cross-entropy loss for Medusa multi-token prediction.
+        
+        Args:
+            outputs (Union[torch.Tensor, list[torch.Tensor]]): Model outputs from MedusaTransformerDecoder.
+                If list, first element is main LM head output, rest are Medusa head outputs.
+                Each output can be either:
+                - A single tensor [batch_size, seq_len, vocab_size]
+                - A list of chunk tensors (when using chunked output)
+            targets (dict[str, Union[torch.Tensor, list[torch.Tensor]]]): Target labels from MedusaTransform.
+                Expected keys:
+                - "labels": Main LM head targets [batch_size, seq_len]
+                - "medusa_labels": List of Medusa head targets, each [batch_size, seq_len]
+                
+        Returns:
+            torch.Tensor: Weighted cross-entropy loss
+        """
+        # Handle single tensor output (fallback to standard cross-entropy)
+        if isinstance(outputs, torch.Tensor):
+            if "labels" not in targets:
+                raise ValueError("targets must contain 'labels' key for single tensor output")
+            return self._compute_single_head_loss(outputs, targets["labels"])
+        
+        # Handle multiple outputs (main + medusa heads)
+        if not isinstance(outputs, list):
+            raise ValueError("outputs must be a torch.Tensor or list of torch.Tensor")
+        
+        if len(outputs) != (1 + self.num_medusa_heads):
+            raise ValueError(f"Expected {1 + self.num_medusa_heads} outputs (1 main + {self.num_medusa_heads} medusa), got {len(outputs)}")
+        
+        # Verify targets format
+        if "labels" not in targets or "medusa_labels" not in targets:
+            raise ValueError("targets must contain 'labels' and 'medusa_labels' keys")
+        
+        if len(targets["medusa_labels"]) != self.num_medusa_heads:
+            raise ValueError(f"Expected {self.num_medusa_heads} medusa label sets, got {len(targets['medusa_labels'])}")
+        
+        total_loss = 0.0
+        total_elements = 0
+        
+        # Main LM head loss
+        main_logits = outputs[0]
+        main_targets = targets["labels"]
+        
+        if isinstance(main_targets, list):
+            main_targets = torch.tensor(main_targets, device=self._get_device_from_output(main_logits))
+        
+        main_loss, main_elements = self._compute_head_loss(main_logits, main_targets)
+        total_loss += self.main_head_weight * main_loss
+        total_elements += main_elements
+        
+        # Medusa heads loss
+        for i, (medusa_logits, medusa_weight) in enumerate(zip(outputs[1:], self.medusa_weights)):
+            medusa_targets = targets["medusa_labels"][i]
+            
+            if isinstance(medusa_targets, list):
+                medusa_targets = torch.tensor(medusa_targets, device=self._get_device_from_output(medusa_logits))
+            
+            medusa_loss, medusa_elements = self._compute_head_loss(medusa_logits, medusa_targets)
+            total_loss += medusa_weight * medusa_loss
+            total_elements += medusa_elements
+        
+        # Average loss by total number of elements
+        if total_elements == 0:
+            return torch.tensor(0.0, device=self._get_device_from_output(outputs[0]), requires_grad=True)
+        
+        return total_loss / total_elements
+    
+    def _get_device_from_output(self, output: Union[torch.Tensor, list[torch.Tensor]]) -> torch.device:
+        """Get device from output, handling both single tensors and lists of chunks."""
+        if isinstance(output, torch.Tensor):
+            return output.device
+        elif isinstance(output, list) and len(output) > 0:
+            return output[0].device
+        else:
+            raise ValueError("Cannot determine device from empty output")
+    
+    def _compute_head_loss(self, logits: Union[torch.Tensor, list[torch.Tensor]], targets: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """
+        Computes cross-entropy loss for a single head, handling both regular and chunked outputs.
+        
+        Args:
+            logits (Union[torch.Tensor, list[torch.Tensor]]): Either a single tensor [batch_size, seq_len, vocab_size]
+                or a list of chunk tensors when using chunked output.
+            targets (torch.Tensor): Target labels [batch_size, seq_len]
+            
+        Returns:
+            tuple[torch.Tensor, int]: (total_loss, total_elements)
+        """
+        # Handle chunked output (list of tensors)
+        if isinstance(logits, list):
+            return self._compute_chunked_head_loss(logits, targets)
+        
+        # Handle single tensor output
+        return self._compute_chunked_loss(logits, targets)
+    
+    def _compute_chunked_head_loss(self, logits_chunks: list[torch.Tensor], targets: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """
+        Computes cross-entropy loss for chunked output from medusa heads.
+        
+        Args:
+            logits_chunks (list[torch.Tensor]): List of logit chunks, each [batch_size, chunk_size, vocab_size]
+            targets (torch.Tensor): Target labels [batch_size, seq_len]
+            
+        Returns:
+            tuple[torch.Tensor, int]: (total_loss, total_elements)
+        """
+        # Count total non-ignored elements
+        mask = targets != self.ignore_index
+        total_elements = mask.sum().item()
+        
+        # Split targets to match logits chunks
+        target_chunks = targets.tensor_split(len(logits_chunks), dim=1)
+        
+        # Ensure we have matching number of chunks
+        if len(logits_chunks) != len(target_chunks):
+            raise ValueError(f"Mismatch between logits chunks ({len(logits_chunks)}) and target chunks ({len(target_chunks)})")
+        
+        # Compute loss for each chunk
+        total_loss = 0.0
+        for logits_chunk, target_chunk in zip(logits_chunks, target_chunks):
+            chunk_loss = self.compute_cross_entropy_chunk(logits_chunk, target_chunk)
+            total_loss += chunk_loss
+        
+        return total_loss, total_elements
+
+    def _compute_single_head_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Fallback method for single head loss computation."""
+        loss, elements = self._compute_chunked_loss(logits, targets)
+        return loss / elements if elements > 0 else torch.tensor(0.0, device=logits.device, requires_grad=True)
+    
+    def _compute_chunked_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """
+        Computes cross-entropy loss using chunking for memory efficiency.
+        
+        Args:
+            logits (torch.Tensor): [batch_size, seq_len, vocab_size]
+            targets (torch.Tensor): [batch_size, seq_len]
+            
+        Returns:
+            tuple[torch.Tensor, int]: (total_loss, total_elements)
+        """
+        # Count total non-ignored elements
+        mask = targets != self.ignore_index
+        total_elements = mask.sum().item()
+        
+        # Chunk along sequence dimension
+        logits_chunks = logits.tensor_split(self.num_output_chunks, dim=1)
+        target_chunks = targets.tensor_split(self.num_output_chunks, dim=1)
+        
+        # Compute loss for each chunk
+        total_loss = 0.0
+        for logits_chunk, target_chunk in zip(logits_chunks, target_chunks):
+            chunk_loss = self.compute_cross_entropy_chunk(logits_chunk, target_chunk)
+            total_loss += chunk_loss
+        
+        return total_loss, total_elements
