@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 from functools import partial
 
-from torchtune.models.llama3_1._component_builders import llama3_1, lora_llama3_1
+from torchtune.models.llama3_1._component_builders import llama3_1, lora_llama3_1, llama3_1_medusa
 
-from torchtune.modules import TransformerDecoder
+from torchtune.modules import TransformerDecoder, MedusaTransformerDecoder
 from torchtune.modules.peft import LORA_ATTN_MODULES
 
 """
@@ -56,6 +56,27 @@ def llama3_1_70b() -> TransformerDecoder:
         attn_dropout=0.0,
         norm_eps=1e-5,
         rope_base=500_000,
+    )
+
+def llama3_1_70b_medusa() -> MedusaTransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 70B parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 70B model
+    """
+    return llama3_1_medusa(
+        vocab_size=128_256,
+        num_layers=80,
+        num_heads=64,
+        num_kv_heads=8,
+        embed_dim=8192,
+        max_seq_len=131072,
+        intermediate_dim=28672,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+        medusa_heads=3,
     )
 
 

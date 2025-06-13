@@ -30,6 +30,7 @@ from .tied_linear import TiedLinear  # noqa
 from .transformer import (  # noqa
     TransformerCrossAttentionLayer,
     TransformerDecoder,
+    MedusaTransformerDecoder,
     TransformerSelfAttentionLayer,
 )
 from .vision_transformer import VisionTransformer
@@ -50,6 +51,7 @@ __all__ = [
     "Fp32LayerNorm",
     "VisionTransformer",
     "TransformerDecoder",
+    "MedusaTransformerDecoder",
     "TransformerSelfAttentionLayer",
     "TransformerCrossAttentionLayer",
     "reparametrize_as_dtype_state_dict_post_hook",
