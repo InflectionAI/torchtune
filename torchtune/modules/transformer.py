@@ -687,3 +687,136 @@ class TransformerDecoder(nn.Module):
             output = self.output(h).float()
 
         return output
+
+class ResBlock(nn.Module):
+    """
+    A Residual Block module.
+
+    This module performs a linear transformation followed by a SiLU activation,
+    and then adds the result to the original input, creating a residual connection.
+
+    Args:
+        hidden_size (int): The size of the hidden layers in the block.
+    """
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        # Initialize as an identity mapping
+        nn.init.zeros_(self.linear.weight)
+        # Use SiLU activation to keep consistent with the Llama model
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        """
+        Forward pass of the ResBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output after the residual connection and activation.
+        """
+        return x + self.act(self.linear(x))
+    
+
+class MedusaTransformerDecoder(TransformerDecoder):
+    """
+    Wrapper around TransformerDecoder that adds Medusa prediction heads for speculative decoding.
+    
+    Args:
+        medusa_heads (int): Number of Medusa prediction heads to add.
+        All other args are passed to the parent TransformerDecoder class.
+    """
+    
+    def __init__(self, *, medusa_heads: int, **kwargs):
+        super().__init__(**kwargs)
+        self.medusa_num_heads = medusa_heads
+        
+        # Get the output dimension from the main output layer
+        if hasattr(self.output, 'out_features'):
+            vocab_size = self.output.out_features
+        elif hasattr(self.output, 'weight'):
+            vocab_size = self.output.weight.shape[0]
+        else:
+            raise ValueError("Unable to determine vocabulary size from output layer")
+        
+        # Get the hidden dimension 
+        hidden_size = self.tok_embeddings.embedding_dim
+        
+        # Create Medusa prediction heads - each is a linear layer from hidden_dim to vocab_size
+        self.medusa_prediction_heads = nn.ModuleList(
+        [
+            nn.Sequential(
+                *([ResBlock(hidden_size)]),
+                nn.Linear(hidden_size, vocab_size, bias=False),
+            )
+            for _ in range(self.medusa_num_heads)
+        ]
+    )
+
+    def forward(self, tokens: torch.Tensor, *, mask: Optional[_MaskType] = None, encoder_input: Optional[torch.Tensor] = None, encoder_mask: Optional[torch.Tensor] = None, input_pos: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass that returns both main LM head output and Medusa head outputs.
+        
+        Returns:
+            Union[torch.Tensor, List[torch.Tensor]]: If output_hidden_states is empty, returns a list
+                where the first element is the main LM head output and subsequent elements are 
+                Medusa head outputs. If output_hidden_states is not empty, returns a list with
+                hidden states, main output, and Medusa outputs.
+        """
+        # input tensor of shape [b, s]
+        seq_len = tokens.shape[1]
+
+        self._validate_inputs(
+            seq_len,
+            mask=mask,
+            encoder_input=encoder_input,
+            encoder_mask=encoder_mask,
+            input_pos=input_pos,
+        )
+
+        # shape: [b, s, d]
+        h = self.tok_embeddings(tokens)
+
+        hidden = []
+        for i, layer in enumerate(self.layers):
+            if i in self.output_hidden_states:
+                hidden.append(h)
+            # shape: [b, s, d]
+            h = layer(
+                h,
+                mask=mask,
+                encoder_input=encoder_input,
+                encoder_mask=encoder_mask,
+                input_pos=input_pos,
+            )
+
+        # Apply normalization before output heads
+        # shape: [b, s, d]
+        h_norm = self.norm(h)
+        
+        # Main LM head output
+        if self.num_output_chunks > 0:
+            main_output = self.chunked_output(h_norm)
+        else:
+            # shape: [b, seq_len, vocab_size]
+            main_output = self.output(h_norm).float()
+        
+        # Medusa head outputs
+        medusa_outputs = []
+        for medusa_head in self.medusa_prediction_heads:
+            # shape: [b, seq_len, vocab_size]
+            medusa_out = medusa_head(h_norm).float()
+            medusa_outputs.append(medusa_out)
+        
+        # Combine outputs
+        all_outputs = [main_output] + medusa_outputs
+        
+        # If hidden states were requested, prepend them
+        if hidden:
+            output = hidden + all_outputs
+        else:
+            output = all_outputs
+            
+        return output
