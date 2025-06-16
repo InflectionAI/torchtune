@@ -111,7 +111,7 @@ class MedusaDataset(Dataset):
         source: str,
         message_transform: Transform,
         model_transform: Transform,
-        num_medusa_heads: int = 4,
+        num_medusa_heads: int = 3,
         filter_fn: Optional[Callable] = None,
         filter_kwargs: Optional[dict[str, Any]] = None,
         **load_dataset_kwargs: dict[str, Any],

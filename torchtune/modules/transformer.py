@@ -720,6 +720,50 @@ class ResBlock(nn.Module):
         return x + self.act(self.linear(x))
     
 
+class MedusaHeads(nn.Module):
+    """
+    Wrapper module for Medusa prediction heads that implements forward method.
+    This is needed for FSDP compatibility since ModuleList doesn't implement forward.
+    """
+    
+    def __init__(self, num_heads: int, hidden_size: int, vocab_size: int):
+        super().__init__()
+        self.medusa_heads = nn.ModuleList([
+            nn.Sequential(
+                *([ResBlock(hidden_size)]),
+                nn.Linear(hidden_size, vocab_size, bias=False),
+            )
+            for _ in range(num_heads)
+        ])
+    
+    def forward(self, hidden_states: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Apply all medusa heads to the input hidden states.
+        
+        Args:
+            hidden_states (torch.Tensor): Input hidden states [batch_size, seq_len, hidden_size]
+            
+        Returns:
+            List[torch.Tensor]: List of outputs from each medusa head [batch_size, seq_len, vocab_size]
+        """
+        outputs = []
+        for head in self.medusa_heads:
+            outputs.append(head(hidden_states).float())
+        return outputs
+    
+    def __iter__(self):
+        """Allow iteration over the heads for backward compatibility."""
+        return iter(self.medusa_heads)
+    
+    def __getitem__(self, idx):
+        """Allow indexing for backward compatibility."""
+        return self.medusa_heads[idx]
+    
+    def __len__(self):
+        """Return number of heads."""
+        return len(self.medusa_heads)
+
+
 class MedusaTransformerDecoder(TransformerDecoder):
     """
     Wrapper around TransformerDecoder that adds Medusa prediction heads for speculative decoding.
@@ -744,16 +788,12 @@ class MedusaTransformerDecoder(TransformerDecoder):
         # Get the hidden dimension 
         hidden_size = self.tok_embeddings.embedding_dim
         
-        # Create Medusa prediction heads - each is a linear layer from hidden_dim to vocab_size
-        self.medusa_heads = nn.ModuleList(
-        [
-            nn.Sequential(
-                *([ResBlock(hidden_size)]),
-                nn.Linear(hidden_size, vocab_size, bias=False),
-            )
-            for _ in range(self.medusa_num_heads)
-        ]
-    )
+        # Create Medusa prediction heads using the wrapper module
+        self.medusa_heads = MedusaHeads(
+            num_heads=self.medusa_num_heads,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size
+        )
 
     def _freeze_body_weights(self):
         """
@@ -820,11 +860,8 @@ class MedusaTransformerDecoder(TransformerDecoder):
         if self.num_output_chunks > 0:
             medusa_outputs = self.chunked_medusa_output(h_norm)
         else:
-            medusa_outputs = []
-            for medusa_head in self.medusa_heads:
-                # shape: [b, seq_len, vocab_size]
-                medusa_out = medusa_head(h_norm).float()
-                medusa_outputs.append(medusa_out)
+            # Use the MedusaHeads forward method which returns a list of outputs
+            medusa_outputs = self.medusa_heads(h_norm)
         
         # Combine outputs
         all_outputs = [main_output] + medusa_outputs
@@ -860,7 +897,7 @@ class MedusaTransformerDecoder(TransformerDecoder):
         hidden_chunks = last_hidden_state.chunk(self.num_output_chunks, dim=1)
         
         # Apply each medusa head to all chunks
-        for medusa_head in self.medusa_heads:
+        for medusa_head in self.medusa_heads.heads:
             # Apply this medusa head to each chunk
             head_chunks = []
             for chunk in hidden_chunks:
@@ -875,3 +912,54 @@ class MedusaTransformerDecoder(TransformerDecoder):
                 medusa_outputs.append(head_chunks)
         
         return medusa_outputs
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        Override load_state_dict to handle missing medusa head weights gracefully.
+        
+        If medusa head weights are missing from the state dict (e.g., when loading a base model),
+        they will be kept at their randomly initialized values and the loading will succeed.
+        
+        Args:
+            state_dict: The state dictionary to load
+            strict: Whether to strictly enforce that the keys in state_dict match this module's keys
+            assign: Whether to assign items in state_dict to their corresponding keys
+            
+        Returns:
+            NamedTuple with missing_keys and unexpected_keys fields
+        """
+        # Identify medusa head keys that are missing from the state dict
+        medusa_keys = {k for k in self.state_dict().keys() if k.startswith('medusa_heads.')}
+        missing_medusa_keys = medusa_keys - set(state_dict.keys())
+        
+        if missing_medusa_keys:
+            # Create a copy of state_dict to avoid modifying the original
+            state_dict = dict(state_dict)
+            
+            # If we're in strict mode but have missing medusa keys, temporarily disable strict mode
+            # and handle the missing keys explicitly
+            if strict:
+                # Load non-medusa weights with strict=True first
+                non_medusa_state_dict = {k: v for k, v in state_dict.items() 
+                                       if not k.startswith('medusa_heads.')}
+                
+                # Temporarily remove medusa heads to avoid key mismatch
+                medusa_heads = self.medusa_heads
+                del self.medusa_heads
+                
+                try:
+                    # Load base model weights strictly
+                    result = super().load_state_dict(non_medusa_state_dict, strict=True, assign=assign)
+                finally:
+                    # Restore medusa heads (they keep their random initialization)
+                    self.medusa_heads = medusa_heads
+                
+                # Update result to include missing medusa keys
+                missing_keys = list(result.missing_keys) + list(missing_medusa_keys)
+                return type(result)(missing_keys, result.unexpected_keys)
+            else:
+                # Non-strict mode: just load what we can
+                return super().load_state_dict(state_dict, strict=False, assign=assign)
+        else:
+            # All medusa keys present, proceed normally
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
