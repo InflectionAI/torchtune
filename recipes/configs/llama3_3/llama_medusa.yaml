@@ -38,7 +38,7 @@ optimizer:
   lr: 1.0e-04
   fused: true
 loss:
-  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
+  _component_: torchtune.modules.loss.WeightedCrossEntropyLoss
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
@@ -50,7 +50,7 @@ enable_activation_offloading: true
 custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']
 # - tok_embeddings
 # - output
-fsdp_cpu_offload: true
+fsdp_cpu_offload: false #true
 compile: false
 optimizer_in_bwd: false
 dtype: bf16
@@ -60,6 +60,7 @@ metric_logger:
   project: torchtune
 log_every_n_steps: 1
 log_peak_memory_stats: true
+log_level: INFO
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: false

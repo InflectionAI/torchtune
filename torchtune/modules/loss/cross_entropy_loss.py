@@ -164,7 +164,7 @@ class WeightedCrossEntropyLoss(nn.Module, SFTLoss):
     
     def __init__(
         self,
-        num_medusa_heads: int = 4,
+        num_medusa_heads: int = 3,
         medusa_weights: Optional[list[float]] = None,
         main_head_weight: float = 0.0,
         ignore_index: int = -100,
@@ -184,7 +184,97 @@ class WeightedCrossEntropyLoss(nn.Module, SFTLoss):
                 raise ValueError(f"medusa_weights length ({len(medusa_weights)}) must match num_medusa_heads ({num_medusa_heads})")
             self.medusa_weights = medusa_weights
         
+        # Initialize model output references (set by set_model_output)
+        self.main_output_layer = None
+        self.medusa_heads = None
+        
         log.info(f"WeightedCrossEntropyLoss initialized with main_head_weight: {main_head_weight}, medusa_weights: {self.medusa_weights}")
+
+    def set_model_output(self, model: nn.Module) -> None:
+        """
+        Modify model output to match the expected input for the WeightedCrossEntropyLoss function.
+        
+        For MedusaTransformerDecoder, this sets up the model to return hidden states instead
+        of final logits, and stores references to both the main output layer and medusa heads
+        for computing losses in the loss function.
+        
+        Args:
+            model (nn.Module): The model, expected to be MedusaTransformerDecoder
+            
+        Raises:
+            ValueError: If the model is not a MedusaTransformerDecoder or has mismatched medusa heads
+        """
+        from torchtune.modules import MedusaTransformerDecoder
+        
+        if not isinstance(model, MedusaTransformerDecoder):
+            raise ValueError(
+                "WeightedCrossEntropyLoss.set_model_output expects a MedusaTransformerDecoder, "
+                f"but got {type(model)}"
+            )
+        
+        # Set model to skip output layer and return hidden states
+        model.skip_output_layer = True
+        
+        # Store references to output layers for loss computation
+        self.main_output_layer = model.output
+        self.medusa_heads = model.medusa_heads
+        
+        # Sync chunking configuration between model and loss
+        if hasattr(model, 'num_output_chunks'):
+            model.num_output_chunks = self.num_output_chunks
+        
+        # Verify we have the expected number of medusa heads
+        if len(self.medusa_heads) != self.num_medusa_heads:
+            raise ValueError(
+                f"Model has {len(self.medusa_heads)} medusa heads, but loss expects {self.num_medusa_heads}"
+            )
+
+    def compute_head_logits(
+        self,
+        hidden_states: torch.Tensor,
+        head_idx: int,
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        """
+        Compute logits for a specific head from hidden states.
+        
+        Args:
+            hidden_states (torch.Tensor): Hidden states [batch_size, seq_len, hidden_dim]
+            head_idx (int): Head index. 0 for main head, 1+ for medusa heads
+            
+        Returns:
+            Union[torch.Tensor, list[torch.Tensor]]: Logits tensor or list of chunked logits
+        """
+        if head_idx == 0:
+            # Main head
+            if self.main_output_layer is None:
+                raise AttributeError("set_model_output must be called before computing head logits")
+            
+            if self.num_output_chunks > 1:
+                # Chunked computation
+                hidden_chunks = hidden_states.tensor_split(self.num_output_chunks, dim=1)
+                logits_chunks = []
+                for chunk in hidden_chunks:
+                    logits_chunks.append(self.main_output_layer(chunk).float())
+                return logits_chunks
+            else:
+                return self.main_output_layer(hidden_states).float()
+        else:
+            # Medusa head
+            medusa_head_idx = head_idx - 1
+            if self.medusa_heads is None or medusa_head_idx >= len(self.medusa_heads):
+                raise AttributeError("set_model_output must be called before computing medusa head logits")
+            
+            medusa_head = self.medusa_heads[medusa_head_idx]
+            
+            if self.num_output_chunks > 1:
+                # Chunked computation
+                hidden_chunks = hidden_states.tensor_split(self.num_output_chunks, dim=1)
+                logits_chunks = []
+                for chunk in hidden_chunks:
+                    logits_chunks.append(medusa_head(chunk).float())
+                return logits_chunks
+            else:
+                return medusa_head(hidden_states).float()
 
     def compute_cross_entropy_chunk(
         self,
@@ -216,75 +306,129 @@ class WeightedCrossEntropyLoss(nn.Module, SFTLoss):
     def forward(
         self,
         outputs: Union[torch.Tensor, list[torch.Tensor]],
-        targets: dict[str, Union[torch.Tensor, list[torch.Tensor]]],
+        targets: Union[torch.Tensor, dict[str, Union[torch.Tensor, list[torch.Tensor]]]],
     ) -> torch.Tensor:
         """
         Computes weighted cross-entropy loss for Medusa multi-token prediction.
         
         Args:
             outputs (Union[torch.Tensor, list[torch.Tensor]]): Model outputs from MedusaTransformerDecoder.
-                If list, first element is main LM head output, rest are Medusa head outputs.
-                Each output can be either:
-                - A single tensor [batch_size, seq_len, vocab_size]
-                - A list of chunk tensors (when using chunked output)
-            targets (dict[str, Union[torch.Tensor, list[torch.Tensor]]]): Target labels from MedusaTransform.
-                Expected keys:
-                - "labels": Main LM head targets [batch_size, seq_len]
-                - "medusa_labels": List of Medusa head targets, each [batch_size, seq_len]
+                After set_model_output is called, this will be hidden states [batch_size, seq_len, hidden_dim].
+                Before set_model_output, this can be a list of logits tensors (main + medusa heads).
+            targets (Union[torch.Tensor, dict[str, Union[torch.Tensor, list[torch.Tensor]]]]): Target labels.
+                Can be either:
+                - A single tensor [batch_size, seq_len] for backward compatibility
+                - A dict with keys "labels" and "medusa_labels" for full medusa training
                 
         Returns:
             torch.Tensor: Weighted cross-entropy loss
         """
-        # Handle single tensor output (fallback to standard cross-entropy)
-        if isinstance(outputs, torch.Tensor):
-            if "labels" not in targets:
-                raise ValueError("targets must contain 'labels' key for single tensor output")
-            return self._compute_single_head_loss(outputs, targets["labels"])
+        # Check if set_model_output has been called (hidden states mode)
+        hidden_states_mode = hasattr(self, 'main_output_layer') and self.main_output_layer is not None
         
-        # Handle multiple outputs (main + medusa heads)
-        if not isinstance(outputs, list):
-            raise ValueError("outputs must be a torch.Tensor or list of torch.Tensor")
-        
-        if len(outputs) != (1 + self.num_medusa_heads):
-            raise ValueError(f"Expected {1 + self.num_medusa_heads} outputs (1 main + {self.num_medusa_heads} medusa), got {len(outputs)}")
-        
-        # Verify targets format
-        if "labels" not in targets or "medusa_labels" not in targets:
-            raise ValueError("targets must contain 'labels' and 'medusa_labels' keys")
-        
-        if len(targets["medusa_labels"]) != self.num_medusa_heads:
-            raise ValueError(f"Expected {self.num_medusa_heads} medusa label sets, got {len(targets['medusa_labels'])}")
-        
-        total_loss = 0.0
-        total_elements = 0
-        
-        # Main LM head loss
-        main_logits = outputs[0]
-        main_targets = targets["labels"]
-        
-        if isinstance(main_targets, list):
-            main_targets = torch.tensor(main_targets, device=self._get_device_from_output(main_logits))
-        
-        main_loss, main_elements = self._compute_head_loss(main_logits, main_targets)
-        total_loss += self.main_head_weight * main_loss
-        total_elements += main_elements
-        
-        # Medusa heads loss
-        for i, (medusa_logits, medusa_weight) in enumerate(zip(outputs[1:], self.medusa_weights)):
-            medusa_targets = targets["medusa_labels"][i]
+        if hidden_states_mode:
+            # Working with hidden states - compute logits for each head
+            if not isinstance(outputs, torch.Tensor):
+                raise ValueError("In hidden states mode, outputs must be a single tensor of hidden states")
             
-            if isinstance(medusa_targets, list):
-                medusa_targets = torch.tensor(medusa_targets, device=self._get_device_from_output(medusa_logits))
+            # Handle targets format
+            if isinstance(targets, torch.Tensor):
+                # Simple case: single target tensor for all heads
+                main_targets = targets
+                medusa_targets = [targets] * self.num_medusa_heads
+            elif isinstance(targets, dict):
+                if "labels" not in targets or "medusa_labels" not in targets:
+                    raise ValueError("targets dict must contain 'labels' and 'medusa_labels' keys")
+                main_targets = targets["labels"]
+                medusa_targets = targets["medusa_labels"]
+                if len(medusa_targets) != self.num_medusa_heads:
+                    raise ValueError(f"Expected {self.num_medusa_heads} medusa label sets, got {len(medusa_targets)}")
+            else:
+                raise ValueError("targets must be a tensor or dict")
             
-            medusa_loss, medusa_elements = self._compute_head_loss(medusa_logits, medusa_targets)
-            total_loss += medusa_weight * medusa_loss
-            total_elements += medusa_elements
+            total_loss = 0.0
+            total_elements = 0
+            
+            # Main head loss
+            if self.main_head_weight > 0:
+                main_logits = self.compute_head_logits(outputs, 0)
+                main_loss, main_elements = self._compute_head_loss(main_logits, main_targets)
+                total_loss += self.main_head_weight * main_loss
+                total_elements += main_elements
+            
+            # Medusa heads loss
+            for i, medusa_weight in enumerate(self.medusa_weights):
+                if medusa_weight > 0:
+                    medusa_logits = self.compute_head_logits(outputs, i + 1)
+                    medusa_loss, medusa_elements = self._compute_head_loss(medusa_logits, medusa_targets[i])
+                    total_loss += medusa_weight * medusa_loss
+                    total_elements += medusa_elements
+            
+            # Average loss by total number of elements
+            if total_elements == 0:
+                return torch.tensor(0.0, device=outputs.device, requires_grad=True)
+            
+            return total_loss / total_elements
         
-        # Average loss by total number of elements
-        if total_elements == 0:
-            return torch.tensor(0.0, device=self._get_device_from_output(outputs[0]), requires_grad=True)
-        
-        return total_loss / total_elements
+        else:
+            # Legacy mode: working with pre-computed logits
+            # Handle single tensor output (fallback to standard cross-entropy)
+            if isinstance(outputs, torch.Tensor):
+                if isinstance(targets, dict) and "labels" in targets:
+                    return self._compute_single_head_loss(outputs, targets["labels"])
+                elif isinstance(targets, torch.Tensor):
+                    return self._compute_single_head_loss(outputs, targets)
+                else:
+                    raise ValueError("targets must contain 'labels' key for single tensor output")
+            
+            # Handle multiple outputs (main + medusa heads)
+            if not isinstance(outputs, list):
+                raise ValueError("outputs must be a torch.Tensor or list of torch.Tensor")
+            
+            if len(outputs) != (1 + self.num_medusa_heads):
+                raise ValueError(f"Expected {1 + self.num_medusa_heads} outputs (1 main + {self.num_medusa_heads} medusa), got {len(outputs)}")
+            
+            # Handle targets format
+            if isinstance(targets, dict):
+                if "labels" not in targets or "medusa_labels" not in targets:
+                    raise ValueError("targets must contain 'labels' and 'medusa_labels' keys")
+                main_targets = targets["labels"]
+                medusa_targets_list = targets["medusa_labels"]
+            else:
+                raise ValueError("With multiple outputs, targets must be a dict with 'labels' and 'medusa_labels' keys")
+            
+            if len(medusa_targets_list) != self.num_medusa_heads:
+                raise ValueError(f"Expected {self.num_medusa_heads} medusa label sets, got {len(medusa_targets_list)}")
+            
+            total_loss = 0.0
+            total_elements = 0
+            
+            # Main LM head loss
+            main_logits = outputs[0]
+            
+            if isinstance(main_targets, list):
+                main_targets = torch.tensor(main_targets, device=self._get_device_from_output(main_logits))
+            
+            main_loss, main_elements = self._compute_head_loss(main_logits, main_targets)
+            total_loss += self.main_head_weight * main_loss
+            total_elements += main_elements
+            
+            # Medusa heads loss
+            for i, (medusa_logits, medusa_weight) in enumerate(zip(outputs[1:], self.medusa_weights)):
+                medusa_targets = medusa_targets_list[i]
+                
+                if isinstance(medusa_targets, list):
+                    medusa_targets = torch.tensor(medusa_targets, device=self._get_device_from_output(medusa_logits))
+                
+                medusa_loss, medusa_elements = self._compute_head_loss(medusa_logits, medusa_targets)
+                total_loss += medusa_weight * medusa_loss
+                total_elements += medusa_elements
+            
+            # Average loss by total number of elements
+            if total_elements == 0:
+                return torch.tensor(0.0, device=self._get_device_from_output(outputs[0]), requires_grad=True)
+            
+            return total_loss / total_elements
     
     def _get_device_from_output(self, output: Union[torch.Tensor, list[torch.Tensor]]) -> torch.device:
         """Get device from output, handling both single tensors and lists of chunks."""

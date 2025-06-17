@@ -730,7 +730,7 @@ class MedusaHeads(nn.Module):
         super().__init__()
         self.medusa_heads = nn.ModuleList([
             nn.Sequential(
-                *([ResBlock(hidden_size)]),
+                ResBlock(hidden_size),
                 nn.Linear(hidden_size, vocab_size, bias=False),
             )
             for _ in range(num_heads)
@@ -822,7 +822,7 @@ class MedusaTransformerDecoder(TransformerDecoder):
         seq_len = tokens.shape[1]
 
         self._validate_inputs(
-            seq_len,
+            tokens=tokens,
             mask=mask,
             encoder_input=encoder_input,
             encoder_mask=encoder_mask,
@@ -882,6 +882,9 @@ class MedusaTransformerDecoder(TransformerDecoder):
         This method splits the hidden state into chunks and applies each medusa head
         to each chunk separately, similar to the main chunked_output method.
         
+        Works with both DTensors and regular tensors by using tensor_split instead of chunk
+        to ensure consistent behavior in distributed settings.
+        
         Args:
             last_hidden_state (torch.Tensor): last hidden state of the decoder, having shape
                 [b, seq_len, embed_dim].
@@ -891,21 +894,54 @@ class MedusaTransformerDecoder(TransformerDecoder):
                 - A single tensor [b, seq_len, vocab_size] if num_output_chunks == 0
                 - A list of chunk tensors if num_output_chunks > 0
         """
+        from torch.distributed.tensor import DTensor
+        
+        print(f"DEBUG: last_hidden_state type: {type(last_hidden_state)}")
+        print(f"DEBUG: last_hidden_state is DTensor: {isinstance(last_hidden_state, DTensor)}")
+        
         medusa_outputs = []
         
-        # Split hidden state into chunks
-        hidden_chunks = last_hidden_state.chunk(self.num_output_chunks, dim=1)
+        # TODO: last hidden state should NOT be cast to a DTensor here,
+        # instead, figure out how to better shard the medusa heads
+        
+        # Use tensor_split instead of chunk for better DTensor compatibility
+        # tensor_split preserves DTensor properties more reliably
+        hidden_chunks = last_hidden_state.tensor_split(self.num_output_chunks, dim=1)
+        
+        print(f"DEBUG: chunk type: {type(hidden_chunks[0])}")
+        print(f"DEBUG: chunk is DTensor: {isinstance(hidden_chunks[0], DTensor)}")
+        
+        # Check if medusa head parameters are DTensors (sharded with FSDP)
+        first_param = next(self.medusa_heads.medusa_heads[0].parameters())
+        is_param_dtensor = isinstance(first_param, DTensor)
+        print(f"DEBUG: medusa head param type: {type(first_param)}")
+        print(f"DEBUG: medusa head param is DTensor: {is_param_dtensor}")
         
         # Apply each medusa head to all chunks
-        for medusa_head in self.medusa_heads.heads:
+        for medusa_head in self.medusa_heads.medusa_heads:
             # Apply this medusa head to each chunk
             head_chunks = []
             for chunk in hidden_chunks:
+                # If medusa head parameters are DTensors but input is regular tensor,
+                # convert input to DTensor with appropriate placement
+                if is_param_dtensor and not isinstance(chunk, DTensor):
+                    # Get mesh from the first parameter
+                    param_mesh = first_param.device_mesh
+                    
+                    # For input activations, we typically want to replicate across all dimensions
+                    # or shard only on the batch dimension, not the feature dimensions like weights
+                    from torch.distributed.tensor import Replicate
+                    input_placements = tuple(Replicate() for _ in range(param_mesh.ndim))
+                    
+                    # Convert chunk to DTensor with replicated placement
+                    chunk = DTensor.from_local(chunk, param_mesh, input_placements)
+                
+                # Process chunk through medusa head
                 chunk_output = medusa_head(chunk).float()
                 head_chunks.append(chunk_output)
             
-            # If chunked output is being used, return list of chunks
-            # Otherwise concatenate chunks back together
+            # If only one chunk, return the tensor directly
+            # Otherwise return list of chunks for further processing
             if len(head_chunks) == 1:
                 medusa_outputs.append(head_chunks[0])
             else:
