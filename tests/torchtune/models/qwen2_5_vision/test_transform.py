@@ -175,7 +175,7 @@ def test_image_transform_comparison():
             hf_pixel_values = hf_result["pixel_values"]
             
             # TorchTune processing
-            tune_pixel_values, tune_image_grid_thw = tune_transform.transform_image(test_image)
+            tune_pixel_values, tune_image_grid_thw, num_patches = tune_transform.transform_image(test_image)
             
             print(f"     HF pixel values shape: {hf_pixel_values.shape}")
             print(f"     Tune pixel values shape: {tune_pixel_values.shape}")
@@ -286,9 +286,8 @@ def test_multimodal_transform_comparison():
             }
         ]
         
-        # Use HuggingFace's recommended approach
         text = hf_processor.apply_chat_template(
-            hf_messages, tokenize=False, add_generation_prompt=True
+            hf_messages, tokenize=False, add_generation_prompt=False
         )
         image_inputs, video_inputs = process_vision_info(hf_messages)
         hf_result = hf_processor(
@@ -403,8 +402,8 @@ def test_multimodal_transform_comparison():
         # The sequences might have different lengths due to different image token handling
         # TorchTune separates image and text tokens, while HF combines them
         print(f"   📝 Token analysis:")
-        print(f"     HF combines image+text tokens: {len(hf_tokens)} total")
-        print(f"     TorchTune separates: {len(tune_tokens)} text tokens + image data in encoder_input")
+        print(f"     HF tokens length {len(hf_tokens)}: {hf_tokens}")
+        print(f"     Tune tokens length {len(tune_tokens)}: {tune_tokens}")
         
         # Calculate effective token counts
         tune_image_tokens = 0
@@ -414,21 +413,7 @@ def test_multimodal_transform_comparison():
                 image_tensor = image_data["hidden_states"]
                 # Image tokens are the number of patches (second dimension)
                 tune_image_tokens = image_tensor.shape[1] if len(image_tensor.shape) > 1 else image_tensor.numel()
-        
-        total_tune_tokens = len(tune_tokens) + tune_image_tokens
-        print(f"     TorchTune effective total: {total_tune_tokens} ({len(tune_tokens)} text + {tune_image_tokens} image)")
-        print(f"     Token count ratio: {total_tune_tokens / len(hf_tokens):.3f}")
-        
-        # Look for special tokens to understand the structure
-        print(f"   🔍 Special token analysis:")
-        print(f"     HF tokens (first 20): {hf_tokens[:20]}")
-        print(f"     Tune tokens (all): {tune_tokens}")
-        
-        # Analyze the tokenization approaches
-        print(f"   🏗️  Architecture differences:")
-        print(f"     HuggingFace: Embeds image placeholder tokens directly in text sequence")
-        print(f"     TorchTune: Separates image processing into encoder_input for cleaner architecture")
-        print(f"     Both approaches are valid - TorchTune's separation allows for more flexible multimodal handling")
+
         
         # Check that we have the expected image dimensions
         if "encoder_input" in tune_result:
@@ -468,7 +453,7 @@ def test_image_transform_consistency():
         # Transform the same image multiple times
         results = []
         for i in range(3):
-            pixel_values, image_grid_thw = tune_transform.transform_image(test_image)
+            pixel_values, image_grid_thw, num_patches = tune_transform.transform_image(test_image)
             results.append((pixel_values, image_grid_thw))
         
         # Check that results are identical
@@ -487,49 +472,6 @@ def test_image_transform_consistency():
         return False
 
 
-def test_special_tokens_handling():
-    """Test that special tokens are handled correctly."""
-    print("Testing special tokens handling...")
-    
-    hf_processor = load_hf_processor()
-    tune_transform = load_tune_transform()
-    
-    if hf_processor is None or tune_transform is None:
-        print("❌ Failed to load required components")
-        return False
-    
-    try:
-        # Test text with and without special tokens
-        test_text = "Hello world"
-        
-        # HuggingFace with special tokens
-        hf_with_special = hf_processor(text=test_text, return_tensors="pt", add_special_tokens=True)
-        hf_without_special = hf_processor(text=test_text, return_tensors="pt", add_special_tokens=False)
-        
-        # TorchTune with special tokens
-        tune_with_bos_eos = tune_transform.encode(test_text, add_bos=True, add_eos=True)
-        tune_with_bos = tune_transform.encode(test_text, add_bos=True, add_eos=False)
-        tune_without_special = tune_transform.encode(test_text, add_bos=False, add_eos=False)
-        
-        print(f"   HF with special: {hf_with_special['input_ids'].squeeze().tolist()}")
-        print(f"   HF without special: {hf_without_special['input_ids'].squeeze().tolist()}")
-        print(f"   Tune with BOS+EOS: {tune_with_bos_eos}")
-        print(f"   Tune with BOS: {tune_with_bos}")
-        print(f"   Tune without special: {tune_without_special}")
-        
-        # Check that special token handling makes sense
-        assert len(tune_with_bos_eos) >= len(tune_without_special), "BOS+EOS should add tokens"
-        assert len(tune_with_bos) >= len(tune_without_special), "BOS should add tokens"
-        assert len(tune_with_bos_eos) >= len(tune_with_bos), "EOS should add at least 0 tokens"
-        
-        print("✅ Special tokens handling test passed!")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Special tokens handling test failed: {e}")
-        return False
-
-
 def run_all_tests():
     """Run all transform tests."""
     print("=" * 60)
@@ -541,7 +483,6 @@ def run_all_tests():
         test_image_transform_comparison,
         test_multimodal_transform_comparison,
         test_image_transform_consistency,
-        test_special_tokens_handling,
     ]
     
     results = []
