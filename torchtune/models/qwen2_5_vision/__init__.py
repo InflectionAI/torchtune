@@ -20,6 +20,7 @@ from ._transform import Qwen2_5_VLImageTransform
 __all__ = [
     "qwen2_5_vl_7b",
     "qwen2_5_vl_transform",
+    "Qwen2_5_VLTransform",
     "qwen2_5_vl_text_decoder",
     "qwen2_5_vision_encoder",
     "Qwen25VLRotaryPositionalEmbeddings",
