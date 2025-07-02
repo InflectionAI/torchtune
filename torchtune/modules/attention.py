@@ -6,6 +6,7 @@
 
 import logging
 from typing import Optional
+import os
 
 import torch
 from torch import nn
@@ -186,6 +187,7 @@ class MultiHeadAttention(nn.Module):
         *,
         mask: Optional[_MaskType] = None,
         input_pos: Optional[torch.Tensor] = None,
+        window_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -232,7 +234,10 @@ class MultiHeadAttention(nn.Module):
         s_y = y.shape[1] if y is not None else 0
 
         # q has shape [b, s_x, num_heads * head_dim]
+        torch.save(x, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_input_to_attn.pt"))
         q = self.q_proj(x)
+        # save projection matrix
+        torch.save(self.q_proj.weight, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_q_proj_weight.pt"))
 
         # number of queries per key/value
         q_per_kv = self.num_heads // self.num_kv_heads
@@ -240,10 +245,13 @@ class MultiHeadAttention(nn.Module):
 
         # Apply positional embeddings
         if self.pos_embeddings is not None:
-            q = self.pos_embeddings(q, input_pos=input_pos)
+            torch.save(q, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_q_before_pos_embed.pt"))
+            q = self.pos_embeddings(q, input_pos=input_pos, window_index=window_index)
+            torch.save(q, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_q_after_pos_embed.pt"))
 
         # [b, n_h, s_x, h_d]
         q = q.transpose(1, 2)
+        torch.save(q, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_q.pt"))
 
         # Normalize q
         if self.q_norm is not None:
@@ -268,7 +276,9 @@ class MultiHeadAttention(nn.Module):
             k = k.view(b, s_y, -1, self.head_dim)
             v = v.view(b, s_y, -1, self.head_dim)
             if self.pos_embeddings is not None:
-                k = self.pos_embeddings(k, input_pos=input_pos)
+                torch.save(k, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_k_before_pos_embed.pt"))
+                k = self.pos_embeddings(k, input_pos=input_pos, window_index=window_index)
+                torch.save(k, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_k_after_pos_embed.pt"))
 
             # k,v shape: [b, n_kv, s_y, h_d]
             k = k.transpose(1, 2)
