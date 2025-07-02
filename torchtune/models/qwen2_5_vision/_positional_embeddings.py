@@ -213,50 +213,23 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         )
         # merge height and width into one dimension
         rope_cache = rope_cache.flatten(1) # [s, h_d]
-        print(f"rope_cache shape: {rope_cache.shape}")
 
         # rearrange indices to match window index
-        print(f"window index: {window_index}")
         assert window_index is not None
         rope_cache = rope_cache.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rope_cache = rope_cache[window_index, :, :]
         rope_cache = rope_cache.reshape(seq_len, -1)
-        print(f"rope_cache shape: {rope_cache.shape}")
-        print(f"rope_cache: {rope_cache}")
 
         # reshape input; the last dimension is used for computing the output.
-        # Cast to float to match the reference implementation
-        # Split into halves like HF implementation: (0,40), (1,41), etc. instead of (0,1), (2,3), etc.
         x_float = x.float()
         half_dim = x_float.shape[-1] // 2
-        x1 = x_float[..., :half_dim]  # First half: [0, 1, ..., 39]
-        x2 = x_float[..., half_dim:]  # Second half: [40, 41, ..., 79]
-        # Stack to create pairs: tensor has shape [b, s, n_h, h_d // 2, 2]
+        x1 = x_float[..., :half_dim]
+        x2 = x_float[..., half_dim:]
         xshaped = torch.stack([x1, x2], dim=-1)
-        print(f"xshaped shape: {xshaped.shape}")
 
         # reshape the cache for broadcasting
-        # tensor has shape [b, s, 1, h_d // 2, 2] if packed samples,
-        # otherwise has shape [1, s, 1, h_d // 2, 2]
         rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
-        print(f"rope_cache reshaped shape: {rope_cache.shape}")
-        print(f"rope_cache reshaped: {rope_cache}")
 
-        # x * cos - y * sin, x * sin + y * cos
-
-        # tensor has shape [b, s, n_h, h_d // 2, 2]
-        print(f"="*100)
-        print(f"ROTATING VECTORS")
-        print(f"xshaped[..., 0]: {xshaped[..., 0]}")
-        print(f"xshaped[..., 1]: {xshaped[..., 1]}")
-        print(f"rope_cache[..., 0]: {rope_cache[..., 0]}")
-        print(f"rope_cache[..., 1]: {rope_cache[..., 1]}")
-
-        # rope_cache[..., 0] is cos, rope_cache[..., 1] is sin
-        torch.save(rope_cache[..., 0], os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_rope_cache_cos.pt"))
-        torch.save(rope_cache[..., 1], os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_rope_cache_sin.pt"))
-        torch.save(xshaped[..., 0], os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_xshaped_0.pt"))
-        torch.save(xshaped[..., 1], os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_xshaped_1.pt"))
         x_out = torch.stack(
             [
                 xshaped[..., 0] * rope_cache[..., 0] 

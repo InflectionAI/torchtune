@@ -159,47 +159,28 @@ class Qwen2_5_VisionTransformer(nn.Module):
             `torch.Tensor`: hidden_states.
         """
         hidden_states = self.patch_embed(hidden_states)
-        print(f"Tune hidden states shape: {hidden_states.shape}")
-        print(f"Tune hidden states: {hidden_states}")
-        torch.save(hidden_states, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_hidden_states.pt"))
 
         rope_index = self.get_rope_index(grid_thw)
-        print(f"Tune grid thw shape: {grid_thw.shape}")
-        print(f"Tune grid thw: {grid_thw}")
-        torch.save(grid_thw, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_grid_thw.pt"))
-        print(f"Tune rope index shape: {rope_index.shape}")
-        print(f"Tune rope index: {rope_index}")
-        torch.save(rope_index, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_rope_index.pt"))
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
-        torch.save(window_index, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_window_index.pt"))
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=hidden_states.device,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-        print(f"Tune cu window seqlens shape: {cu_window_seqlens.shape}")
-        print(f"Tune cu window seqlens: {cu_window_seqlens}")
-        torch.save(cu_window_seqlens, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_cu_window_seqlens.pt"))
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
         hidden_states = hidden_states.unsqueeze(0)
-        print(f"Tune hidden states shape 2: {hidden_states.shape}")
-        print(f"Tune hidden states 2: {hidden_states}")
-        torch.save(hidden_states, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_hidden_states_2.pt"))
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        print(f"Tune cu seqlens shape: {cu_seqlens.shape}")
-        print(f"Tune cu seqlens: {cu_seqlens}")
-        torch.save(cu_seqlens, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_cu_seqlens.pt"))
 
         for layer_num, blk in enumerate(self.layers):
             if layer_num in self.fullatt_block_indexes:
@@ -213,13 +194,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             for i in range(1, len(cu_seqlens_now)):
                 attention_mask[..., cu_seqlens_now[i - 1] : cu_seqlens_now[i], cu_seqlens_now[i - 1] : cu_seqlens_now[i]] = 0
 
-            assert window_index is not None
-            torch.save(attention_mask, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_attention_mask.pt"))
             hidden_states = blk(hidden_states, input_pos=rope_index, mask=attention_mask, window_index=window_index)
-            # break   # TODO: remove
-        print(f"Tune hidden states shape 3: {hidden_states.shape}")
-        print(f"Tune hidden states 3: {hidden_states}")
-        torch.save(hidden_states, os.path.join(os.environ["ENCODER_TEST_PATH"], "tune_hidden_states_3.pt"))
 
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
