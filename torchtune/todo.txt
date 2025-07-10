@@ -1,0 +1,20 @@
+1. kv_cache eviction functionality - must be included in recipe
+
+
+A       recipes/configs/llama3_3/llama_medusa.yaml
+M       recipes/full_finetune_distributed.py
+M       torchtune/datasets/__init__.py
+A       torchtune/datasets/_medusa.py
+M       torchtune/models/convert_weights.py
+M       torchtune/models/llama3_1/__init__.py
+M       torchtune/models/llama3_1/_component_builders.py
+M       torchtune/models/llama3_1/_model_builders.py
+M       torchtune/modules/__init__.py
+M       torchtune/modules/loss/__init__.py
+M       torchtune/modules/loss/cross_entropy_loss.py
+M       torchtune/modules/transformer.py
+
+
+"""
+Implementation strategy: the Medusa heads need the (last_hidden_state,  hidden_dim, vocab_size) from the last transformer layer. The hidden_dim, vocab_size are known during the component_building phase. Only the last_hidden_state needs to be obtained. The last TransformerDecoder block can return this separately but will have to be initialized separately to expose this. The hidden_state will have to be extracted and so on. An alternative implementation would be to add that as the last layer of the TransformerDecoder to create the MedusaTransformerDecoder from which the [base_output, stacked_medusa_logits] can be extracted. This was the original implementation chosen during the hackathon. The second implementation will be tried right now.
+"""

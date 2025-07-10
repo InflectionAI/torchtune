@@ -51,6 +51,11 @@ class KVCache(nn.Module):
     def size(self) -> int:
         return self.cache_pos[0].item()
 
+    """This function is to be called after verifying medusa head predictions to revert cache state to valid_cache_len by evicting the invalid medusa predictions"""
+    def evict_from_cache(self, valid_cache_len):
+        len_kv_remove = self.size - valid_cache_len
+        self.cache_pos.subtract_(len_kv_remove)
+
     def update(
         self, k_val: torch.Tensor, v_val: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

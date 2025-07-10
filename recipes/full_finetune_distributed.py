@@ -700,7 +700,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Freeze body weights for MedusaTransformerDecoder - only train medusa heads
         if isinstance(model, MedusaTransformerDecoder):
-            self._freeze_body_weights(model)
+            # model._freeze_base_model()
+            # self._freeze_body_weights(model)
+            self._count_params(model)
 
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
@@ -740,6 +742,26 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         for medusa_head in model.medusa_heads:
             for param in medusa_head.parameters():
                 param.requires_grad = True
+
+        # Count trainable parameters for logging
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+
+        utils.log_rank_zero(
+            self._logger,
+            f"Frozen body weights for MedusaTransformerDecoder. "
+            f"Training {trainable_params:,} out of {total_params:,} parameters "
+            f"({trainable_params/total_params*100:.2f}%)"
+        )
+
+    def _count_params(self, model: MedusaTransformerDecoder) -> None:
+        """
+        Freeze all parameters in the model except for the medusa prediction heads.
+        This ensures only the medusa heads are trained while keeping the base model frozen.
+        
+        Args:
+            model (MedusaTransformerDecoder): The medusa model to freeze
+        """
 
         # Count trainable parameters for logging
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
