@@ -178,6 +178,7 @@ class WeightedCrossEntropyLoss(nn.Module, SFTLoss):
         
         # Set default exponentially decreasing weights if not provided
         if medusa_weights is None:
+            self.medusa_weights = [0.8**i for i in range(num_medusa_heads)]
             self.medusa_weights = [1.0 / (2 ** i) for i in range(num_medusa_heads)]
         else:
             if len(medusa_weights) != num_medusa_heads:

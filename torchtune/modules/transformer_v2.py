@@ -729,21 +729,18 @@ class MedusaHeads(nn.Module):
         """
         This implements the entire MedusaHeads forward pass and returns the stacked_medusa_logits in the shape: [medusa_num_heads, batch_size, vocab_size]
         """
+        super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.medusa_num_layers = medusa_num_layers
         self.medusa_num_heads = medusa_num_heads
 
-        #Medusa's original repo names this variable as medusa_head
-        self.medusa_heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    *([ResBlock(self.hidden_size)] * medusa_num_layers),
-                    nn.Linear(self.hidden_size, self.vocab_size, bias=False),
-                )
-                for _ in range(medusa_num_heads)
-            ]
-        )
+        # Note Medusa's original repo names this variable as medusa_head not medusa_heads
+        self.medusa_heads = nn.ModuleList()
+        for _ in range(medusa_num_heads):
+            res_blocks = nn.Sequential(*([ResBlock(self.hidden_size)] * medusa_num_layers))
+            linear_layer = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+            self.medusa_heads.append(nn.ModuleList([res_blocks, linear_layer]))
 
     def forward(self, base_hidden_state):
         hidden_states = base_hidden_state.clone()
@@ -812,6 +809,7 @@ class MedusaTransformerDecoder(TransformerDecoder):
         The output returned by unembed will be ultimately returned by the parent TransformerDecoder as follows:
         output = output if not hidden else [*hidden, output]
         """
+        
         # Get base output from parent
         base_output = super().unembed(h)
         # In medusa's original implementation, the normed_last_hidden_state is passed to the heads.
