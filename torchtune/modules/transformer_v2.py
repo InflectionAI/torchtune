@@ -312,7 +312,6 @@ class TransformerCrossAttentionLayer(nn.Module):
         out = h + self.mlp_scale(mlp_out)
         return out
 
-
 def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
     """
     Return a list of ``n`` identical layers.
@@ -736,33 +735,49 @@ class MedusaHeads(nn.Module):
         self.medusa_num_heads = medusa_num_heads
 
         # Note Medusa's original repo names this variable as medusa_head not medusa_heads
-        self.medusa_heads = nn.ModuleList()
+        self.medusa_layers = nn.ModuleList()
         for _ in range(medusa_num_heads):
             res_blocks = nn.Sequential(*([ResBlock(self.hidden_size)] * medusa_num_layers))
             linear_layer = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
-            self.medusa_heads.append(nn.ModuleList([res_blocks, linear_layer]))
+            self.medusa_layers.append(nn.ModuleList([res_blocks, linear_layer]))
+        
 
     def forward(self, base_hidden_state):
+        """
+        This only returns the stacked_medusa_hidden in shape [num_heads, batch_size, embed_dim]
+        """
         hidden_states = base_hidden_state.clone()
-        medusa_logits = []
+        medusa_hidden = []
         # TODO: Consider parallelizing this loop for efficiency?
         for i in range(self.medusa_num_heads):
-            medusa_logits.append(self.medusa_heads[i](hidden_states))
+            medusa_hidden.append(self.medusa_layers[i](hidden_states))
         
-        stacked_medusa_logits = torch.stack(medusa_logits, dim=0)
-        return stacked_medusa_logits
+        # stacked_medusa_hidden = torch.stack(medusa_hidden, dim=0)
+        return medusa_hidden
+
+    def get_medusa_output(self, medusa_hidden, chunked = False):
+        medusa_output = []
+        for i in range(self.medusa_num_heads):
+            medusa_hidden = medusa_hidden[i]
+            medusa_linear_layer = self.medusa_layers[i][1]
+            if chunked == True:
+                output = [medusa_linear_layer(medusa_hidden).float() for chunk in medusa_hidden.tensor_split(self.num_output_chunks, dim=1)]
+            else:
+                output = medusa_linear_layer(medusa_hidden).float()
+            medusa_output.append(output)
+        return medusa_output
         
     def __iter__(self):
         """Allow iteration over the heads for backward compatibility."""
-        return iter(self.medusa_heads)
+        return iter(self.medusa_layers)
     
     def __getitem__(self, idx):
         """Allow indexing for backward compatibility."""
-        return self.medusa_heads[idx]
+        return self.medusa_layers[idx]
     
     def __len__(self):
         """Return number of heads."""
-        return len(self.medusa_heads)
+        return len(self.medusa_layers)
 
 class MedusaTransformerDecoder(TransformerDecoder):
     def __init__(self, *, medusa_num_layers: int = 3, medusa_num_heads: int = 3, **kwargs):
@@ -801,33 +816,53 @@ class MedusaTransformerDecoder(TransformerDecoder):
             params.requires_grad = False
         for params in self.medusa_heads.parameters():
             params.requires_grad = True
-    
+
     def unembed(self, h):
         
         """
         Override to add Medusa outputs to base output.
-        The output returned by unembed will be ultimately returned by the parent TransformerDecoder as follows:
-        output = output if not hidden else [*hidden, output]
+        The output returned by unembed will be ultimately returned by the parent TransformerDecoder as [base_output, medusa_output].
+        This is ultimately returned as output = [*hidden, base_output, medusa_output]
         """
         
         # Get base output from parent
         base_output = super().unembed(h)
+        # Handle both tensor and list cases for batch_size
+        if isinstance(base_output, list):
+            batch_size = base_output[0].shape[0]
+        else:
+            batch_size = base_output.shape[0]
+            
         # In medusa's original implementation, the normed_last_hidden_state is passed to the heads.
         h = self.norm(h)
-        stacked_medusa_logits = self.medusa_heads(h)
- 
-        # Return combined outputs
-        if isinstance(base_output, list):
-            return base_output + stacked_medusa_logits
+        # Pass base LM hidden state to medusa heads and return the final hidden state before applying the medusa linear layer 
+        medusa_hidden = self.medusa_heads(h)
+        
+        # Follow the same embed logic as the base LM output layer
+        if self.skip_output_layer:
+            medusa_output = medusa_hidden
+        elif self.num_output_chunks > 0:
+                        medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden, chunked = True)
         else:
-            return [base_output] + stacked_medusa_logits
+            # shape: [b, seq_len, vocab_dim]
+            medusa_output = []
+            # Perform the linear layer pass for each medusa_hidden_state and stack them in shape [num_heads, batch_size, vocab_dim]
+            medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden, chunked = True)
+            # stacked_medusa_output = torch.stack(medusa_output, dim=0)
+            # assert(medusa_output[0].shape == (batch_size, self.vocab_size))
+        # Return combined outputs
+
+        if isinstance(base_output, list):
+            return base_output + [medusa_output]
+        else:
+            return [base_output, medusa_output]
 
     def forward(self, tokens: torch.Tensor, *, mask: Optional[_MaskType] = None, encoder_input: Optional[torch.Tensor] = None, encoder_mask: Optional[torch.Tensor] = None, input_pos: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Forward pass that returns both main LM head output and Medusa head outputs.
 
         The combined output is formatted as follows:
-        [*hidden, output, stacked_medusa_logits]
+        [*hidden, output,num_medusa_heads*medusa_logits]
         """
         # Get the base output from parent
         combined_output = super().forward(tokens, mask=mask, encoder_input=encoder_input, 
