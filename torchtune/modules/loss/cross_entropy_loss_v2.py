@@ -1,3 +1,16 @@
+# Here, outputs is assumed to be the entire [*hidden, base_hidden_state, medusa_hidden_states] outputted by MedusaTransformerDecoder
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.distributed.tensor import DTensor
+from typing import Optional, Union
+
+from torchtune.modules.loss.loss_types import SFTLoss
+from torchtune.utils import get_logger
+
+log = get_logger()
+
 class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
     """Memory efficient Cross-entropy loss that incrementally computes loss for chunks of tokens
     by masking ignored tokens, calculating logits and then applying cross-entropy loss. Combines
@@ -24,7 +37,7 @@ class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
             num_output_chunks (int): Number of chunks to split the output tensor into. Default is 8.
             ignore_index (int): Index to ignore in the target tensor. Default is -100.
         """
-        self.linear_projection = None
+        self.medusa_linear_layers = None
         self.num_output_chunks = num_output_chunks
         self.ignore_index = ignore_index
 
@@ -41,12 +54,16 @@ class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
     def set_model_output(self, model: nn.Module) -> None:
         """Modify model output to match the expected input for the loss function."""
         model.skip_output_layer = True
-        self.linear_projection = model.output
+        self.medusa_linear_layers = model.medusa_heads.medusa_linear_layers
+        self.num_medusa_heads = model.medusa_heads.num_medusa_heads
+        self.medusa_loss_weights = [0.8**i for i in range(self.num_medusa_heads)]
+        self.hidden_size = model.hidden_size
 
     def compute_cross_entropy(
         self,
         hidden_chunk: torch.Tensor,
         target_chunk: torch.Tensor,
+        head_index : int,
     ) -> torch.Tensor:
         """Computes cross-entropy by masking tokens, calculating logits and then applying cross-entropy loss.
 
@@ -79,9 +96,9 @@ class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
             hidden_chunk = hidden_chunk[mask_chunk]  # [num_valid, embed_dim]
 
         # [num_valid, embed_dim] @ [embed_dim, vocab_size]
-        if self.linear_projection is None:
+        if self.medusa_linear_layers is None:
             raise AttributeError("forward called before update_model")
-        logits = self.linear_projection(hidden_chunk)  # [num_valid, vocab_size]
+        logits = self.medusa_linear_layers[head_index](hidden_chunk)  # [num_valid, vocab_size]
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
 
@@ -105,22 +122,31 @@ class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
         Returns:
             torch.Tensor: loss tensor
         """
+        # Here, outputs is assumed to be the entire [*hidden, base_hidden_state, medusa_hidden_states] outputted by MedusaTransformerDecoder
+
         # Total number of non-ignored tokens across the entire batch
         mask = targets != self.ignore_index
         total_elements = mask.sum()
-
-        # Chunk along sequence dimension
-        hidden_chunks = outputs.tensor_split(self.num_output_chunks, dim=1)
-        target_chunks = targets.tensor_split(self.num_output_chunks, dim=1)
-
-        # Compute cross-entropy loss for the chunks
         total_loss = 0.0
-        for idx in range(len(hidden_chunks)):
-            total_loss += self.compute_cross_entropy(
-                hidden_chunks[idx],
-                target_chunks[idx],
-            )
+        for i in range(self.num_medusa_heads):
+            hidden_state = outputs[1+i][:,:(-2+i)].contiguous()
+            medusa_targets = targets[:,i+2:].contiguous()
+            # Flatten the tensors since cross-entropy expects 2D hidden_chunks
+            hidden_state = hidden_state.view(-1, self.hidden_size)
+            medusa_targets = medusa_targets.view(-1)
 
+            # Chunk along sequence dimension
+            hidden_chunks = hidden_state.tensor_split(self.num_output_chunks, dim=0)
+            target_chunks = medusa_targets.tensor_split(self.num_output_chunks, dim=0)
+
+            # Compute cross-entropy loss for the chunks
+            loss_per_head = 0.0
+            for idx in range(len(hidden_chunks)):
+                loss_per_head += self.compute_cross_entropy(
+                    hidden_chunks[idx],
+                    target_chunks[idx], head_index = i
+                )
+            total_loss += loss_per_head * self.medusa_loss_weights[i]
         if total_elements == 0:
             # must return after calling compute_cross_entropy to not hang during data parallel training
             return total_loss

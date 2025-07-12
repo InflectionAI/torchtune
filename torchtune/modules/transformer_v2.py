@@ -735,11 +735,13 @@ class MedusaHeads(nn.Module):
         self.medusa_num_heads = medusa_num_heads
 
         # Note Medusa's original repo names this variable as medusa_head not medusa_heads
-        self.medusa_layers = nn.ModuleList()
+        self.medusa_base = nn.ModuleList()
+        self.medusa_linear_layers = nn.ModuleList()
         for _ in range(medusa_num_heads):
             res_blocks = nn.Sequential(*([ResBlock(self.hidden_size)] * medusa_num_layers))
             linear_layer = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
-            self.medusa_layers.append(nn.ModuleList([res_blocks, linear_layer]))
+            self.medusa_base.append(res_blocks)
+            self.medusa_linear_layers.append(linear_layer)
         
 
     def forward(self, base_hidden_state):
@@ -750,34 +752,38 @@ class MedusaHeads(nn.Module):
         medusa_hidden = []
         # TODO: Consider parallelizing this loop for efficiency?
         for i in range(self.medusa_num_heads):
-            medusa_hidden.append(self.medusa_layers[i](hidden_states))
+            medusa_hidden.append(self.medusa_base[i](hidden_states))
         
         # stacked_medusa_hidden = torch.stack(medusa_hidden, dim=0)
         return medusa_hidden
 
-    def get_medusa_output(self, medusa_hidden, chunked = False):
+    def get_medusa_output(self, hidden_state, chunked = False, num_output_chunks = None):
         medusa_output = []
         for i in range(self.medusa_num_heads):
-            medusa_hidden = medusa_hidden[i]
-            medusa_linear_layer = self.medusa_layers[i][1]
+            hidden_state_i = hidden_state[i]
             if chunked == True:
-                output = [medusa_linear_layer(medusa_hidden).float() for chunk in medusa_hidden.tensor_split(self.num_output_chunks, dim=1)]
+                output = [self.medusa_linear_layers[i](chunk).float() for chunk in hidden_state_i.tensor_split(num_output_chunks, dim=1)]
             else:
-                output = medusa_linear_layer(medusa_hidden).float()
+                output = self.medusa_linear_layers[i](hidden_state_i).float()
             medusa_output.append(output)
         return medusa_output
         
     def __iter__(self):
         """Allow iteration over the heads for backward compatibility."""
-        return iter(self.medusa_layers)
+        return iter(self.medusa_base)
     
     def __getitem__(self, idx):
         """Allow indexing for backward compatibility."""
-        return self.medusa_layers[idx]
+        if idx == 0:
+            return self.medusa_base
+        elif idx == 1:
+            return self.medusa_linear_layers
+        else:
+            raise IndexError(f"MedusaHeads only supports indexing 0 (base layers) and 1 (linear layers), got {idx}")
     
     def __len__(self):
         """Return number of heads."""
-        return len(self.medusa_layers)
+        return len(self.medusa_base)
 
 class MedusaTransformerDecoder(TransformerDecoder):
     def __init__(self, *, medusa_num_layers: int = 3, medusa_num_heads: int = 3, **kwargs):
@@ -836,22 +842,21 @@ class MedusaTransformerDecoder(TransformerDecoder):
         # In medusa's original implementation, the normed_last_hidden_state is passed to the heads.
         h = self.norm(h)
         # Pass base LM hidden state to medusa heads and return the final hidden state before applying the medusa linear layer 
-        medusa_hidden = self.medusa_heads(h)
+        medusa_hidden_state = self.medusa_heads(h)
         
         # Follow the same embed logic as the base LM output layer
         if self.skip_output_layer:
-            medusa_output = medusa_hidden
+            medusa_output = medusa_hidden_state
         elif self.num_output_chunks > 0:
-                        medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden, chunked = True)
+            # Calculate the chunked_outputs with shape [num_heads, num_output_chunks, batch_size, seq_len, vocab_dim/num_output_chunks]
+            medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden_state, chunked = True, num_output_chunks = self.num_output_chunks)
         else:
-            # shape: [b, seq_len, vocab_dim]
+            # Calculate the outputs without chunking with shape: [num_heads, batch_size, seq_len, vocab_dim]
             medusa_output = []
-            # Perform the linear layer pass for each medusa_hidden_state and stack them in shape [num_heads, batch_size, vocab_dim]
-            medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden, chunked = True)
-            # stacked_medusa_output = torch.stack(medusa_output, dim=0)
-            # assert(medusa_output[0].shape == (batch_size, self.vocab_size))
+            # Perform the linear layer pass for each hidden_state and put them in an array[num_heads, batch_size, seq_len, vocab_dim]
+            medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden_state, chunked = False)
+            
         # Return combined outputs
-
         if isinstance(base_output, list):
             return base_output + [medusa_output]
         else:
