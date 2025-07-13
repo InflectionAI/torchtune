@@ -38,7 +38,7 @@ optimizer:
   lr: 1.0e-04
   fused: true
 loss:
-  _component_: torchtune.modules.loss.WeightedCrossEntropyLoss
+  _component_: torchtune.modules.loss.MedusaCrossEntropyLoss
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
