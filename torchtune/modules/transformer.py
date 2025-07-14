@@ -857,10 +857,10 @@ class MedusaTransformerDecoder(TransformerDecoder):
             medusa_output = self.medusa_heads.get_medusa_output(medusa_hidden_state, chunked = False)
             
         # Return combined outputs
-        if isinstance(base_output, list):
-            return base_output + [medusa_output]
+        if isinstance(base_output, list) and isinstance(base_output, list):
+            return base_output + medusa_output
         else:
-            return [base_output, medusa_output]
+            return [base_output] + medusa_output
 
     def forward(self, tokens: torch.Tensor, *, mask: Optional[_MaskType] = None, encoder_input: Optional[torch.Tensor] = None, encoder_mask: Optional[torch.Tensor] = None, input_pos: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
         """

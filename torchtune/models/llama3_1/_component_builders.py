@@ -48,7 +48,7 @@ def llama3_1_medusa(
     intermediate_dim: Optional[int] = None,
     norm_eps: float = 1e-5,
     scale_factor: int = 8,
-    medusa_heads: int = 3,
+    medusa_num_heads: int = 3,
 ) -> TransformerDecoder:
     """
     Build the decoder associated with the Llama3.1 model. This includes:
@@ -118,7 +118,7 @@ def llama3_1_medusa(
         head_dim=head_dim,
         norm=RMSNorm(embed_dim, eps=norm_eps),
         output=output_proj,
-        medusa_heads=medusa_heads,
+        medusa_num_heads=medusa_num_heads,
     )
 
 # ------------------ Vanilla Llama3.1 ------------------
