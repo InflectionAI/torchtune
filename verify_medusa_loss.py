@@ -7,7 +7,7 @@ This script tests various aspects of the loss function to ensure it's working co
 import torch
 import torch.nn as nn
 from torchtune.models.llama3_1._model_builders import llama3_1_8b_medusa
-from torchtune.modules.loss.cross_entropy_loss import MedusaCrossEntropyLoss
+from torchtune.modules.loss.cross_entropy_loss import MedusaCrossEntropyLoss, LinearCrossEntropyLoss
 
 def test_loss_initialization():
     """Test that the loss function can be initialized correctly."""
@@ -15,6 +15,8 @@ def test_loss_initialization():
     
     try:
         loss_fn = MedusaCrossEntropyLoss(num_output_chunks=8, ignore_index=-100)
+        # loss_fn = LinearCrossEntropyLoss(num_output_chunks=8, ignore_index=-100)
+
         print(f"✓ Loss function initialized successfully")
         print(f"✓ Loss type: {type(loss_fn)}")
         print(f"✓ num_output_chunks: {loss_fn.num_output_chunks}")
@@ -55,11 +57,12 @@ def test_model_setup(loss_fn):
             print(f"✓ Loss function set up with model")
             
             # Check that model was modified correctly
-            print(f"✓ Model skip_output_layer: {model.skip_output_layer}")
-            print(f"✓ Medusa linear layers: {loss_fn.medusa_linear_layers is not None}")
-            print(f"✓ Number of medusa heads: {loss_fn.medusa_num_heads}")
-            print(f"✓ Hidden size: {loss_fn.hidden_size}")
-            print(f"✓ Loss weights: {loss_fn.medusa_loss_weights}")
+            # print(f"✓ Model skip_output_layer: {model.skip_output_layer}")
+            # print(f"✓ Medusa linear layers: {loss_fn.medusa_linear_layers is not None}")
+            # if not isinstance(loss_fn, LinearCrossEntropyLoss):
+            #     print(f"✓ Number of medusa heads: {loss_fn.medusa_num_heads}")
+            # print(f"✓ Hidden size: {loss_fn.hidden_size}")
+            # print(f"✓ Loss weights: {loss_fn.medusa_loss_weights}")
         
         return model
     except Exception as e:
@@ -75,8 +78,8 @@ def test_forward_pass(loss_fn, model):
         return
     
     # Create test inputs
-    batch_size = 1
-    seq_len = 10
+    batch_size = 20
+    seq_len = 50
     vocab_size = 128_256
     
     # Create random hidden states (simulating model output)
@@ -96,6 +99,8 @@ def test_forward_pass(loss_fn, model):
     loss_fn.set_model_output(model)
     # loss_fn.num_output_chunks = 1
     outputs = model(input_tokens)
+    if isinstance(loss_fn, LinearCrossEntropyLoss):
+        outputs = outputs[0]
     loss = loss_fn(outputs, targets)
     
     print(f"✓ Forward pass completed successfully")
@@ -185,6 +190,8 @@ def test_edge_cases(loss_fn, model):
     
     targets = torch.full((batch_size, seq_len), -100).cuda()  # All ignored
     outputs = model(input_tokens)
+    if isinstance(loss_fn, LinearCrossEntropyLoss):
+        outputs = outputs[0]
     loss = loss_fn(outputs, targets)
     print(f"✓ All ignored tokens - Loss: {loss.item()}")
     
@@ -192,6 +199,8 @@ def test_edge_cases(loss_fn, model):
     
     input_tokens = torch.randint(0, vocab_size, (1, 1)).cuda()
     outputs = model(input_tokens)
+    if isinstance(loss_fn, LinearCrossEntropyLoss):
+        outputs = outputs[0]
     targets = torch.randint(0, 128_256, (1, 1)).cuda()
     # breakpoint()
     loss = loss_fn(outputs, targets)
@@ -202,6 +211,8 @@ def test_edge_cases(loss_fn, model):
     
     targets = torch.randint(0, 128_256, (100, 100)).cuda()
     outputs = model(input_tokens)
+    if isinstance(loss_fn, LinearCrossEntropyLoss):
+        outputs = outputs[0]
     loss = loss_fn(outputs, targets)
     print(f"✓ Large sequence - Loss: {loss.item()}")
     
