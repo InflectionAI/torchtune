@@ -7,7 +7,7 @@
 from .ce_chunked_output_loss import CEWithChunkedOutputLoss
 
 # from .cross_entropy_loss import LinearCrossEntropyLoss, WeightedCrossEntropyLoss
-from .cross_entropy_loss_v2 import MedusaCrossEntropyLoss
+from .cross_entropy_loss import MedusaCrossEntropyLoss
 
 from .kd_losses import (
     ForwardKLLoss,

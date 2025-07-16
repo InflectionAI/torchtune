@@ -1,6 +1,6 @@
+# model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
 
-model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
-
+model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
 output_dir: tmp/doesntmatter
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer

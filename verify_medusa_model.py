@@ -8,13 +8,14 @@ import torch
 import torch.nn as nn
 from torchtune.models.llama3_1._model_builders import llama3_1_8b_medusa
 from torchtune.modules import MedusaTransformerDecoder
+from torchtune.models.convert_weights import *
 
-def test_model_instantiation():
+def test_model_instantiation(model):
     """Test that the model can be instantiated correctly."""
     print("=== Testing Model Instantiation ===")
     
     try:
-        model = llama3_1_8b_medusa()
+        # model = llama3_1_8b_medusa()
         print(f"✓ Model instantiated successfully")
         print(f"✓ Model type: {type(model)}")
         print(f"✓ Expected type: {MedusaTransformerDecoder}")
@@ -297,11 +298,53 @@ def check_device_consistency(model, inputs, targets=None):
     if targets is not None:
         assert targets.device == model_device, "Target and model on different devices!"
 
+def keychecker(model, checkpoint):
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(checkpoint.keys())
+    
+    common = model_keys & checkpoint_keys
+    model_only = model_keys - checkpoint_keys
+    checkpoint_only = checkpoint_keys - model_keys
+    
+    print(f"Keys common to both: {len(common)}")
+    print(f"Keys only in model: {len(model_only)}")
+    print(f"Keys only in checkpoint: {len(checkpoint_only)}")
+    missing_base_keys = []
+    for key in model_only:
+        if "medusa" not in key:
+            missing_base_keys.append(key)
+            # raise ValueError(f"Base model key not found: {key}")
+    print("The following base model keys are missing: ", missing_base_keys)
+    # if model_only:
+    #     print(f"Model-only keys: {list(model_only)}")
+    # if checkpoint_only:
+    #     print(f"Checkpoint-only keys: {list(checkpoint_only)}")
+    
+    
+
 def main():
     """Run all verification tests."""
     print("Medusa Model Verification Script")
     print("=" * 50)
+    model_dir = "/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/consolidated.00.pth"
+    checkpoint_params_path = "/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/params.json"
     
+    # Read model parameters from JSON
+    import json
+    
+    with open(checkpoint_params_path, 'r') as f:
+        checkpoint_params = json.load(f)
+    print(f"✓ Loaded model parameters from: {checkpoint_params_path}")
+    print(f"✓ Model parameters: {checkpoint_params}")
+    required_params = {"num_heads":32, "num_kv_heads":32, "dim":4096}
+
+    for key in required_params:
+        if key in checkpoint_params:
+            required_params[key] = checkpoint_params[key]
+        else:
+            print(key, " not found in checkpoint_params json")
+    
+
     # Check GPU availability
     if torch.cuda.is_available():
         print(f"✓ CUDA available with {torch.cuda.device_count()} devices")
@@ -311,7 +354,8 @@ def main():
         print("✗ CUDA not available, will use CPU")
     
     # Set GPU device and create model
-    gpu_id = 4  # Change this to use a different GPU (0, 1, 2, etc.)
+
+    gpu_id = 1  # Change this to use a different GPU (0, 1, 2, etc.)
     
     if torch.cuda.is_available():
         
@@ -319,20 +363,49 @@ def main():
         print(f"✓ Set GPU device to: {gpu_id}")
         print(f"✓ Using GPU: {torch.cuda.get_device_name(gpu_id)}")
         torch.set_default_device("cuda")
+        
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+        print(f"✓ Cleared GPU cache")
 
-    # Create model and move to device
-    # model = llama3_1_8b_medusa()
+    # Create model on CPU first to avoid memory issues
+    model = llama3_1_8b_medusa()
+    
+    # Move to GPU if available
     if torch.cuda.is_available():
-        model = llama3_1_8b_medusa()
-        # model = model.cuda()
+        model = model.cuda()
+        print(f"✓ Model moved to GPU: {torch.cuda.current_device()}")
+    
+    # Load checkpoint if available
+    try:
+        checkpoint_path = model_dir
+        if torch.cuda.is_available():
+            checkpoint = torch.load(checkpoint_path, map_location='cuda')
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # keychecker(model, checkpoint)
+        converted_checkpoint = meta_to_tune(checkpoint)
+        # keychecker(model, converted_checkpoint)
+        # breakpoint()
+        model.load_state_dict(converted_checkpoint, strict=False)
+        print(f"✓ Model loaded from checkpoint: {checkpoint_path}")
+    except FileNotFoundError:
+        print(f"✗ Checkpoint not found at: {checkpoint_path}")
+        print("✓ Using randomly initialized model")
+    except Exception as e:
+        print(f"✗ Error loading checkpoint: {e}")
+        print("✓ Using randomly initialized model")
+    
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        model = model.cuda()
         print(f"✓ Model moved to GPU: {torch.cuda.current_device()}")
         print("model is on:", next(model.parameters()).device)
     else:
-        model = llama3_1_8b_medusa()
         print("✓ Model running on CPU")
     
     # Test 1: Model instantiation
-    test_model_instantiation()
+    test_model_instantiation(model)
     
     # Test 2: Forward pass
     outputs = test_forward_pass(model)
