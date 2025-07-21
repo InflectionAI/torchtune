@@ -1,0 +1,49 @@
+# Medusa Finetuning Configuration
+# This file contains all the configuration parameters for training a Medusa model
+
+# Model Configuration
+model:
+  checkpoint_path: "/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/consolidated.00.pth"
+  params_path: "/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/params.json"
+  num_medusa_heads: 4
+  freeze_base_model: true  # Only train Medusa heads, freeze base model
+
+# Training Configuration
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_epochs: 3
+  max_length: 512
+  log_every: 10
+  save_every: 100
+
+# Data Configuration
+data:
+  # Use synthetic data for demonstration
+  # Set to actual data path when using real data
+  data_path: null
+  num_samples: 1000  # Only used for synthetic data
+  train_split: 0.8
+  val_split: 0.2
+
+# Hardware Configuration
+hardware:
+  device: "cuda"
+  gpu_id: 1  # Change this to use a different GPU
+  num_workers: 0  # Set to 0 for simplicity, increase for multi-GPU
+
+# Output Configuration
+output:
+  save_dir: "./checkpoints"
+  log_dir: "./logs/medusa_training"
+  tensorboard: true
+
+# Advanced Configuration
+advanced:
+  resume_from: null  # Path to checkpoint to resume from
+  mixed_precision: true
+  gradient_accumulation_steps: 1
+  warmup_steps: 100
+  scheduler_type: "cosine"  # cosine, linear, constant 
