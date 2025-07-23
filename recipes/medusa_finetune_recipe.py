@@ -638,20 +638,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 parallelize_plan=self.tp_plan,
             )
 
-        # We currently have two versions of activation checkpointing in this recipe
-        # for testing and BC purposes. ``enable_activation_checkpointing`` controls
-        # the older version of AC and this behavior is unchanged
-        # ac_mode and ac_option together control selective AC. This is only enabled
-        # when these are set AND ``enable_activation_checkpointing`` is set to False
-        # We'll clean this up as soon as testing of AC is complete
-        if (not enable_activation_checkpointing) and (ac_mode is not None):
-            apply_selective_activation_checkpointing(
-                model,
-                ac_mode,
-                ac_option,
-            )
-
         # We'll apply FSDP wrapping after model and Medusa heads are fully initialized
+        # Activation checkpointing will be applied after FSDP sharding
 
         # Define context manager for context parallelism
         self.context_parallel_manager = training.get_context_parallel_manager(
@@ -761,47 +749,36 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             if self._is_rank_zero:
                 utils.log_rank_zero(self._logger, "🔧 Applying single FSDP wrapping to model (including Medusa heads)...")
             
-            # Create a combined auto-wrap policy for both transformer layers and custom sharded layers
-            if enable_activation_checkpointing and ac_mode is None:
-                # Define custom sharded layer types
-                custom_layer_types = set()
-                if custom_sharded_layers:
-                    for name, module in model.named_modules():
-                        for custom_name in custom_sharded_layers:
-                            if custom_name in name:
-                                custom_layer_types.add(type(module))
-                
-                # Combine with transformer attention layers
-                auto_wrap_policy = {modules.TransformerSelfAttentionLayer} | custom_layer_types
-                
-                if self._is_rank_zero:
-                    utils.log_rank_zero(self._logger, f"🔧 Auto-wrap policy includes: {[cls.__name__ for cls in auto_wrap_policy]}")
-                
-                # Apply FSDP with combined policy
-                training.set_activation_checkpointing(
-                    model, auto_wrap_policy=auto_wrap_policy
+            # Always apply FSDP sharding first, regardless of activation checkpointing settings
+            # Create shard conditions for both transformer layers and custom sharded layers
+            fsdp_shard_conditions = [
+                partial(
+                    training.get_shard_conditions,
+                    names_to_match=custom_sharded_layers,
                 )
+            ]
+            
+            # Add transformer attention layers to shard conditions
+            def transformer_shard_condition(name: str, module: nn.Module) -> bool:
+                return isinstance(module, modules.TransformerSelfAttentionLayer)
+            
+            fsdp_shard_conditions.append(transformer_shard_condition)
+            
+            if self.parallel_dims.dp_replicate_enabled:
+                dp_mesh_dim_names = ("dp_replicate", "dp_shard")
             else:
-                # If not using activation checkpointing, apply FSDP with custom sharding only
-                fsdp_shard_conditions = [
-                    partial(
-                        training.get_shard_conditions,
-                        names_to_match=custom_sharded_layers,
-                    )
-                ]
+                dp_mesh_dim_names = ("dp_shard",)
 
-                if self.parallel_dims.dp_replicate_enabled:
-                    dp_mesh_dim_names = ("dp_replicate", "dp_shard")
-                else:
-                    dp_mesh_dim_names = ("dp_shard",)
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, f"🔧 Applying FSDP sharding with {len(fsdp_shard_conditions)} shard conditions")
 
-                training.shard_model(
-                    model=model,
-                    shard_conditions=fsdp_shard_conditions,
-                    cpu_offload=fsdp_cpu_offload,
-                    reshard_after_forward=reshard_after_forward,
-                    dp_mesh=self.world_mesh[dp_mesh_dim_names],
-                )
+            training.shard_model(
+                model=model,
+                shard_conditions=fsdp_shard_conditions,
+                cpu_offload=fsdp_cpu_offload,
+                reshard_after_forward=reshard_after_forward,
+                dp_mesh=self.world_mesh[dp_mesh_dim_names],
+            )
             
             # Debug: Check model parameters after FSDP sharding
             if self._is_rank_zero:
@@ -845,6 +822,22 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     utils.log_rank_zero(self._logger, f"🔍 output_hidden_states after FSDP: {model.output_hidden_states}")
                 else:
                     utils.log_rank_zero(self._logger, "⚠️  Warning: model does not have output_hidden_states attribute")
+        
+        # Apply activation checkpointing AFTER FSDP sharding
+        # We currently have two versions of activation checkpointing in this recipe
+        # for testing and BC purposes. ``enable_activation_checkpointing`` controls
+        # the older version of AC and this behavior is unchanged
+        # ac_mode and ac_option together control selective AC. This is only enabled
+        # when these are set AND ``enable_activation_checkpointing`` is set to False
+        # We'll clean this up as soon as testing of AC is complete
+        if (not enable_activation_checkpointing) and (ac_mode is not None):
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, "🔧 Applying selective activation checkpointing after FSDP sharding...")
+            apply_selective_activation_checkpointing(
+                model,
+                ac_mode,
+                ac_option,
+            )
         
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
