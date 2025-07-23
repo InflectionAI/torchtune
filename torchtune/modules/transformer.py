@@ -843,6 +843,7 @@ class MedusaTransformerDecoder(TransformerDecoder):
             batch_size = base_output.shape[0]
             
         # In medusa's original implementation, the normed_last_hidden_state is passed to the heads.
+        h = h.detach()
         h = self.norm(h)
         # Pass base LM hidden state to medusa heads and return the final hidden state before applying the medusa linear layer 
         medusa_hidden_state = self.medusa_heads(h)

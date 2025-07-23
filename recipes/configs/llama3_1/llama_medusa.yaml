@@ -50,7 +50,7 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
 max_steps_per_epoch: null
-run_val_every_n_steps: 100  # Run validation every 100 steps
+run_val_every_n_steps: 2  # Run validation every 100 steps
 batch_size_val: 4  # Validation batch size (can be higher than training)
 save_best_checkpoint: true  # Save best checkpoint based on validation loss
 clip_grad_norm: 1.0  # Gradient clipping for stability

@@ -101,13 +101,40 @@ class MedusaCrossEntropyLoss(nn.Module, SFTLoss):
         # [num_valid, embed_dim] @ [embed_dim, vocab_size]
         if self.medusa_linear_layers is None:
             raise AttributeError("forward called before update_model")
-        logits = self.medusa_linear_layers[head_index](hidden_chunk)  # [num_valid, vocab_size]
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
+        
+        # Get the linear layer and handle DTensor weights
+        linear_layer = self.medusa_linear_layers[head_index]
+        
+        # Extract weights and bias, converting to local if they're DTensors
+        weight = linear_layer.weight
+        bias = linear_layer.bias
+        
+        # Convert all tensors to local to avoid NCCL compatibility issues
+        if isinstance(hidden_chunk, DTensor):
+            hidden_chunk = hidden_chunk.to_local()
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        if bias is not None and isinstance(bias, DTensor):
+            bias = bias.to_local()
+        
+        # Manual linear computation with local tensors
+        logits = F.linear(hidden_chunk, weight, bias)  # [num_valid, vocab_size]
 
+        # Filter out invalid target values to avoid CUDA assert errors
+        vocab_size = logits.shape[-1]
+        valid_mask = (target_chunk >= 0) & (target_chunk < vocab_size)
+        
+        if valid_mask.sum() == 0:
+            # If no valid targets, return zero loss
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        
+        # Only compute loss on valid targets
+        valid_targets = target_chunk[valid_mask]
+        valid_logits = logits[valid_mask]
+        
         return F.cross_entropy(
-            logits.float(),
-            target_chunk,
+            valid_logits.float(),
+            valid_targets,
             reduction="sum",
             ignore_index=self.ignore_index,
         )
