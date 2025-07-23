@@ -210,6 +210,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             assert (
                 cfg.get("dataset_val") is not None
             ), "run_val_every_n_steps is set but dataset_val is not configured"
+        
+        # Best checkpoint tracking
+        self._best_val_loss = float('inf')
+        self._save_best_checkpoint = cfg.get("save_best_checkpoint", True)
 
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
@@ -647,33 +651,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ac_option,
             )
 
-        # original activation checkpointing (full) - flip the condition above
-        if enable_activation_checkpointing and ac_mode is None:
-            training.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
-            )
-
-        # Apply Fully Sharded Data Parallelism to the model
-        if self.parallel_dims.dp_shard_enabled:
-            fsdp_shard_conditions = [
-                partial(
-                    training.get_shard_conditions,
-                    names_to_match=custom_sharded_layers,
-                )
-            ]
-
-            if self.parallel_dims.dp_replicate_enabled:
-                dp_mesh_dim_names = ("dp_replicate", "dp_shard")
-            else:
-                dp_mesh_dim_names = ("dp_shard",)
-
-            training.shard_model(
-                model=model,
-                shard_conditions=fsdp_shard_conditions,
-                cpu_offload=fsdp_cpu_offload,
-                reshard_after_forward=reshard_after_forward,
-                dp_mesh=self.world_mesh[dp_mesh_dim_names],
-            )
+        # We'll apply FSDP wrapping after model and Medusa heads are fully initialized
 
         # Define context manager for context parallelism
         self.context_parallel_manager = training.get_context_parallel_manager(
@@ -690,17 +668,58 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # This method will convert the full model state dict into a sharded state
         # dict and load into the model
-        training.load_from_full_model_state_dict(
-            model,
-            model_state_dict,
-            self._device,
-            strict=False,  # Allow missing Medusa head weights
-            cpu_offload=fsdp_cpu_offload,
-        )
+        try:
+            training.load_from_full_model_state_dict(
+                model,
+                model_state_dict,
+                self._device,
+                strict=False,  # Allow missing Medusa head weights
+                cpu_offload=fsdp_cpu_offload,
+            )
+        except AttributeError as e:
+            if "'Parameter' object has no attribute '_local_tensor'" in str(e):
+                utils.log_rank_zero(self._logger, f"❌ FSDP AttributeError during checkpoint loading: {e}")
+                
+                # Debug: Identify problematic parameters
+                utils.log_rank_zero(self._logger, "🔍 Attempting to identify problematic parameter...")
+                
+                problematic_params = []
+                for name, param in model.named_parameters():
+                    if not hasattr(param, '_local_tensor'):
+                        problematic_params.append({
+                            'name': name,
+                            'type': type(param).__name__,
+                            'shape': param.shape if hasattr(param, 'shape') else 'unknown',
+                            'device': param.device if hasattr(param, 'device') else 'unknown',
+                            'dtype': param.dtype if hasattr(param, 'dtype') else 'unknown'
+                        })
+                
+                if problematic_params:
+                    utils.log_rank_zero(self._logger, f"⚠️  Found {len(problematic_params)} parameters without _local_tensor:")
+                    for param_info in problematic_params[:5]:  # Show first 5
+                        utils.log_rank_zero(self._logger, f"   - {param_info['name']} ({param_info['type']})")
+                        utils.log_rank_zero(self._logger, f"     Shape: {param_info['shape']}, Device: {param_info['device']}, Dtype: {param_info['dtype']}")
+                    if len(problematic_params) > 5:
+                        utils.log_rank_zero(self._logger, f"   ... and {len(problematic_params) - 5} more")
+                
+                # Re-raise the error after logging
+                raise
+            else:
+                # Re-raise if it's a different AttributeError
+                raise
 
         # Log parameter counts for MedusaTransformerDecoder (model auto-freezes during init)
         if isinstance(model, MedusaTransformerDecoder):
             self._count_params(model)
+            
+            # Print module names for debugging
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, "=== Model Module Names ===")
+                for name, module in model.named_modules():
+                    param_count = sum(p.numel() for p in module.parameters())
+                    if param_count > 0:
+                        utils.log_rank_zero(self._logger, f"{name}: {type(module).__name__} ({param_count:,} params)")
+            
             # Move Medusa heads to device since they weren't loaded from checkpoint
             with training.set_default_dtype(self._dtype), self._device:
                 for name, param in model.medusa_heads.named_parameters():
@@ -736,6 +755,97 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         else:
                             setattr(model.medusa_heads, attr_name, new_param)
                         utils.log_rank_zero(self._logger, f"Initialized Medusa head parameter: {name}")
+        
+        # Apply Fully Sharded Data Parallelism to the model AFTER Medusa heads are initialized
+        if self.parallel_dims.dp_shard_enabled:
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, "🔧 Applying single FSDP wrapping to model (including Medusa heads)...")
+            
+            # Create a combined auto-wrap policy for both transformer layers and custom sharded layers
+            if enable_activation_checkpointing and ac_mode is None:
+                # Define custom sharded layer types
+                custom_layer_types = set()
+                if custom_sharded_layers:
+                    for name, module in model.named_modules():
+                        for custom_name in custom_sharded_layers:
+                            if custom_name in name:
+                                custom_layer_types.add(type(module))
+                
+                # Combine with transformer attention layers
+                auto_wrap_policy = {modules.TransformerSelfAttentionLayer} | custom_layer_types
+                
+                if self._is_rank_zero:
+                    utils.log_rank_zero(self._logger, f"🔧 Auto-wrap policy includes: {[cls.__name__ for cls in auto_wrap_policy]}")
+                
+                # Apply FSDP with combined policy
+                training.set_activation_checkpointing(
+                    model, auto_wrap_policy=auto_wrap_policy
+                )
+            else:
+                # If not using activation checkpointing, apply FSDP with custom sharding only
+                fsdp_shard_conditions = [
+                    partial(
+                        training.get_shard_conditions,
+                        names_to_match=custom_sharded_layers,
+                    )
+                ]
+
+                if self.parallel_dims.dp_replicate_enabled:
+                    dp_mesh_dim_names = ("dp_replicate", "dp_shard")
+                else:
+                    dp_mesh_dim_names = ("dp_shard",)
+
+                training.shard_model(
+                    model=model,
+                    shard_conditions=fsdp_shard_conditions,
+                    cpu_offload=fsdp_cpu_offload,
+                    reshard_after_forward=reshard_after_forward,
+                    dp_mesh=self.world_mesh[dp_mesh_dim_names],
+                )
+            
+            # Debug: Check model parameters after FSDP sharding
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, "🔍 Debugging model parameters after FSDP sharding...")
+                
+                # Count parameters
+                total_params = sum(p.numel() for p in model.parameters())
+                utils.log_rank_zero(self._logger, f"Total parameters: {total_params:,}")
+                
+                # Check parameter types and FSDP status
+                param_types = {}
+                fsdp_params = 0
+                non_fsdp_params = 0
+                
+                for name, param in model.named_parameters():
+                    param_type = type(param).__name__
+                    if param_type not in param_types:
+                        param_types[param_type] = []
+                    param_types[param_type].append(name)
+                    
+                    if hasattr(param, '_local_tensor'):
+                        fsdp_params += 1
+                    else:
+                        non_fsdp_params += 1
+                        if non_fsdp_params <= 10:  # Log first 10 non-FSDP params
+                            utils.log_rank_zero(self._logger, f"   Non-FSDP param: {name} ({param_type})")
+                
+                utils.log_rank_zero(self._logger, f"Parameter types: {list(param_types.keys())}")
+                utils.log_rank_zero(self._logger, f"FSDP parameters: {fsdp_params}, Non-FSDP parameters: {non_fsdp_params}")
+                
+                if non_fsdp_params > 0:
+                    utils.log_rank_zero(self._logger, f"⚠️  Warning: {non_fsdp_params} parameters are not properly sharded with FSDP")
+                else:
+                    utils.log_rank_zero(self._logger, "✅ All parameters successfully sharded with FSDP")
+                
+                # Ensure output_hidden_states is properly initialized after FSDP wrapping
+                if hasattr(model, 'output_hidden_states'):
+                    if model.output_hidden_states is None:
+                        model.output_hidden_states = []
+                        utils.log_rank_zero(self._logger, "🔧 Fixed: output_hidden_states was None, set to empty list")
+                    utils.log_rank_zero(self._logger, f"🔍 output_hidden_states after FSDP: {model.output_hidden_states}")
+                else:
+                    utils.log_rank_zero(self._logger, "⚠️  Warning: model does not have output_hidden_states attribute")
+        
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading, activation_offloading_use_streams
@@ -902,19 +1012,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Compute loss
         loss = self._loss_fn(outputs, labels)
-        
-        # Debug: Check for NaN loss
-        if torch.isnan(loss) or torch.isinf(loss):
-            utils.log_rank_zero(self._logger, f"WARNING: Loss is {loss.item()}")
-            utils.log_rank_zero(self._logger, f"Outputs type: {type(outputs)}")
-            if isinstance(outputs, list):
-                utils.log_rank_zero(self._logger, f"Number of outputs: {len(outputs)}")
-                for i, out in enumerate(outputs):
-                    if isinstance(out, torch.Tensor):
-                        utils.log_rank_zero(self._logger, f"Output {i} shape: {out.shape}, dtype: {out.dtype}")
-                        utils.log_rank_zero(self._logger, f"Output {i} has NaN: {torch.isnan(out).any()}")
-                        utils.log_rank_zero(self._logger, f"Output {i} has Inf: {torch.isinf(out).any()}")
-            utils.log_rank_zero(self._logger, f"Labels shape: {labels.shape}, dtype: {labels.dtype}")
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -955,6 +1052,29 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         log_dict = {"val_loss": avg_val_loss}
 
+        # Save best checkpoint if validation loss improved
+        if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
+            self._best_val_loss = avg_val_loss
+            if self._is_rank_zero:
+                self._logger.info(f"New best validation loss: {avg_val_loss:.4f}")
+                # Save best checkpoint
+                self._checkpoint_client.save_checkpoint(
+                    model=self._model,
+                    optimizer=(
+                        self._optimizer
+                        if not self._optimizer_in_bwd
+                        else self._optim_ckpt_wrapper
+                    ),
+                    training_progress=TrainingProgress(
+                        seed=self.seed,
+                        epochs_run=self.epochs_run,
+                        total_epochs=self.total_epochs,
+                        max_steps_per_epoch=self.max_steps_per_epoch,
+                        dataloader_state_dict=self._dataloader.state_dict(),
+                    ),
+                    epoch=f"best_val_loss_{avg_val_loss:.4f}",
+                )
+
         if self._is_rank_zero:
             self._logger.info(f"Validation loss: {avg_val_loss:.4f}")
             self._metric_logger.log_dict(
@@ -985,11 +1105,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         num_tokens = 0
 
         self._profiler.start()
+
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
             self._dataloader.sampler.set_epoch(curr_epoch)
+
             for idx, batch in enumerate(self._dataloader):
+                if self._is_rank_zero and idx % 10 == 0:  # Log every 10 steps
+                    utils.log_rank_zero(self._logger, f"📦 Processing batch {idx}")
+                
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1011,24 +1136,82 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
+                # Disable context parallel manager to avoid deadlocks
                 with self.context_parallel_manager(list(batch.values())):
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
-                    # For optimizer in backward, we need to normalize before calling backward
-                    # This case and gradient accumulation are mutually exclusive
-                    if self._optimizer_in_bwd:
-                        torch.distributed.all_reduce(num_tokens)
-                        torch.distributed.all_reduce(running_loss)
-                        current_loss = current_loss * (self.dp_degree / num_tokens)
-                    current_loss.backward()
+
+                # For optimizer in backward, we need to normalize before calling backward
+                # This case and gradient accumulation are mutually exclusive
+                if self._optimizer_in_bwd:
+                    torch.distributed.all_reduce(num_tokens)
+                    torch.distributed.all_reduce(running_loss)
+                    current_loss = current_loss * (self.dp_degree / num_tokens)
+
+                    if self._is_rank_zero:
+                        utils.log_rank_zero(self._logger, f"🔄 Starting backward pass...")
+                        utils.log_rank_zero(self._logger, f"🔍 Loss tensor info - type: {type(current_loss)}, device: {current_loss.device}, requires_grad: {current_loss.requires_grad}")
+                        # Check memory before backward
+                        if torch.cuda.is_available():
+                            utils.log_rank_zero(self._logger, f"🔍 CUDA memory before backward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                        
+                        # Check if model is wrapped in FSDP
+                        if hasattr(self._model, '_fsdp_wrapped'):
+                            utils.log_rank_zero(self._logger, f"🔍 Model is FSDP wrapped: {self._model._fsdp_wrapped}")
+                        
+                        # Check distributed process group
+                        utils.log_rank_zero(self._logger, f"🔍 World size: {self.world_size}, Rank: {self._rank}")
+
+                    # Add timeout and error handling for backward
+                    try:
+                        import signal
+                        
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("Backward pass timed out")
+                        
+                        # Set a 30-second timeout for backward pass
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(30)
+                        
+                        # Try to identify if it's an FSDP communication issue
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"🔍 About to call backward()...")
+                        
+                        current_loss.backward()
+                        
+                        # Cancel the alarm
+                        signal.alarm(0)
+                        
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"✅ Backward pass completed")
+                            if torch.cuda.is_available():
+                                utils.log_rank_zero(self._logger, f"🔍 CUDA memory after backward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                                
+                    except TimeoutError:
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"❌ Backward pass timed out after 30 seconds")
+                            utils.log_rank_zero(self._logger, f"🔍 This suggests a communication deadlock in FSDP")
+                        raise
+                    except Exception as e:
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"❌ Error in backward pass: {e}")
+                            import traceback
+                            utils.log_rank_zero(self._logger, f"❌ Backward traceback: {traceback.format_exc()}")
+                        raise
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    if self._is_rank_zero:
+                        utils.log_rank_zero(self._logger, f"🔄 Starting optimizer step...")
+                    
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
                         torch.distributed.all_reduce(num_tokens)
                         # This will ensure that the logged loss matches what we're optimizing
                         torch.distributed.all_reduce(running_loss)
+
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"✅ All-reduce completed")
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
@@ -1036,6 +1219,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             self.world_size / num_tokens,
                             False if self.parallel_dims.tp_enabled else None,
                         )
+
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"✅ Gradient scaling completed")
 
                         if self._clip_grad_norm is not None:
                             trainable_params = [p for p in self._model.parameters() if p.requires_grad]
@@ -1047,7 +1233,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             # If sharded, collect the DTensor here
                             if isinstance(grad_norm, DTensor):
                                 grad_norm = grad_norm.full_tensor()
+                        
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"🔄 Calling optimizer.step()...")
+                        
                         self._optimizer.step()
+                        
+                        if self._is_rank_zero:
+                            utils.log_rank_zero(self._logger, f"✅ Optimizer step completed")
+                        
                         self._optimizer.zero_grad(set_to_none=True)
 
                     # Update the number of steps when the weights are updated

@@ -398,6 +398,9 @@ class TransformerDecoder(nn.Module):
         self.causal_mask = None
         self.num_output_chunks = 0
         self.skip_output_layer = False
+        
+        # Store the number of layers before activation checkpointing wraps them
+        self.num_layers = len(layers) if hasattr(layers, '__len__') else num_layers
 
         # attributes for KV caches during inference
         self.encoder_max_cache_seq_len = None
@@ -663,7 +666,7 @@ class TransformerDecoder(nn.Module):
                 input_pos=input_pos,
             )
 
-        if len(self.layers) in self.output_hidden_states:
+        if self.num_layers in self.output_hidden_states:
             hidden.append(h)
 
         # shape: [b, seq_len, out_dim]

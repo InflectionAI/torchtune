@@ -1,11 +1,10 @@
 # model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
 
 model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
-output_dir: tmp/doesntmatter
+output_dir: medusa_checkpoints/
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
   path: ${model_dir}/tokenizer.model
-  max_seq_len: 5120
 dataset:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
@@ -14,10 +13,20 @@ dataset:
   train_on_input: True
   packed: False
   conversation_style: openai
-  num_medusa_heads: 3
-  split: train[:10%]
+  split: train[:80%]  # Training data
+dataset_val:
+- _component_: torchtune.datasets.medusa_chat_dataset
+  source: json
+  data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  conversation_column: messages
+  train_on_input: True
+  packed: False
+  conversation_style: openai
+  split: train[80%:]  # Validation data
 
-seed: null
+collate_fn: "torchtune.data.padded_collate_sft"
+
+seed: 42
 shuffle: true
 model:
   _component_: torchtune.models.llama3_1.llama3_1_8b_medusa
@@ -28,9 +37,9 @@ checkpointer:
   recipe_checkpoint: null
   output_dir: ${output_dir}
   model_type: LLAMA3
-resume_from_checkpoint: false
-batch_size: 1
-epochs: 1
+resume_from_checkpoint: false  # Ensure fresh start
+batch_size: 2  # Reduced to avoid memory issues
+epochs: 5
 optimizer:
   _component_: torch.optim.AdamW
   lr: 1.0e-04
@@ -41,14 +50,17 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
 max_steps_per_epoch: null
-gradient_accumulation_steps: 1
+run_val_every_n_steps: 100  # Run validation every 100 steps
+batch_size_val: 4  # Validation batch size (can be higher than training)
+save_best_checkpoint: true  # Save best checkpoint based on validation loss
+clip_grad_norm: 1.0  # Gradient clipping for stability
+gradient_accumulation_steps: 3
 device: cuda
-enable_activation_checkpointing: true
+enable_activation_checkpointing: true  # Disable to reduce complexity
 enable_activation_offloading: false
-custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']
-# - tok_embeddings
-# - output
+custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']  # Include Medusa heads in FSDP sharding
 fsdp_cpu_offload: false #true
+fsdp_reshard_after_forward: true  # Try SHARD_GRAD_OP strategy to reduce communication
 compile: false
 optimizer_in_bwd: false
 dtype: bf16
@@ -58,9 +70,9 @@ metric_logger:
   log_dir: ${output_dir}/logs
   project: torchtune
 
-log_every_n_steps: 1
-log_peak_memory_stats: true
-log_level: INFO
+log_every_n_steps: 1  # Log every 100 steps instead of every step
+log_peak_memory_stats: false  # Turn off memory logging
+log_level: INFO  # Only show warnings and errors
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: false
