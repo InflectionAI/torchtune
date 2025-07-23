@@ -1,0 +1,1 @@
+conda activate ~/vanshaj/medusaenv && python medusa_inference.py --model_path tmp/doesntmatter/epoch_0/model-00001-of-00001.bin --params_path /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/params.json --prompt "The future of artificial intelligence is" --max_new_tokens 20 --temperature 0.7 --num_medusa_heads 1 --compare --fast_test

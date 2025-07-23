@@ -694,14 +694,48 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             model,
             model_state_dict,
             self._device,
-            strict=True,
+            strict=False,  # Allow missing Medusa head weights
             cpu_offload=fsdp_cpu_offload,
         )
 
         # Log parameter counts for MedusaTransformerDecoder (model auto-freezes during init)
         if isinstance(model, MedusaTransformerDecoder):
             self._count_params(model)
-
+            # Move Medusa heads to device since they weren't loaded from checkpoint
+            with training.set_default_dtype(self._dtype), self._device:
+                for name, param in model.medusa_heads.named_parameters():
+                    if param.is_meta:
+                        # Create new parameter with proper initialization and replace it in the module
+                        if 'weight' in name:
+                            # Use Xavier/Glorot initialization for weights
+                            new_param = nn.Parameter(
+                                torch.nn.init.xavier_uniform_(
+                                    torch.empty(size=param.shape, device=self._device, requires_grad=True)
+                                )
+                            )
+                        elif 'bias' in name:
+                            # Use zero initialization for biases
+                            new_param = nn.Parameter(
+                                torch.zeros(size=param.shape, device=self._device, requires_grad=True)
+                            )
+                        else:
+                            # Default initialization for other parameters
+                            new_param = nn.Parameter(
+                                torch.randn(size=param.shape, device=self._device, requires_grad=True) * 0.02
+                            )
+                        
+                        # Get the parent module and attribute name
+                        module_path = name.rsplit('.', 1)[0] if '.' in name else ''
+                        attr_name = name.rsplit('.', 1)[1] if '.' in name else name
+                        
+                        if module_path:
+                            parent_module = model.medusa_heads
+                            for part in module_path.split('.'):
+                                parent_module = getattr(parent_module, part)
+                            setattr(parent_module, attr_name, new_param)
+                        else:
+                            setattr(model.medusa_heads, attr_name, new_param)
+                        utils.log_rank_zero(self._logger, f"Initialized Medusa head parameter: {name}")
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading, activation_offloading_use_streams
@@ -709,7 +743,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
-
+        print("Successful")
         utils.log_rank_zero(
             self._logger,
             f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
@@ -868,6 +902,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Compute loss
         loss = self._loss_fn(outputs, labels)
+        
+        # Debug: Check for NaN loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            utils.log_rank_zero(self._logger, f"WARNING: Loss is {loss.item()}")
+            utils.log_rank_zero(self._logger, f"Outputs type: {type(outputs)}")
+            if isinstance(outputs, list):
+                utils.log_rank_zero(self._logger, f"Number of outputs: {len(outputs)}")
+                for i, out in enumerate(outputs):
+                    if isinstance(out, torch.Tensor):
+                        utils.log_rank_zero(self._logger, f"Output {i} shape: {out.shape}, dtype: {out.dtype}")
+                        utils.log_rank_zero(self._logger, f"Output {i} has NaN: {torch.isnan(out).any()}")
+                        utils.log_rank_zero(self._logger, f"Output {i} has Inf: {torch.isinf(out).any()}")
+            utils.log_rank_zero(self._logger, f"Labels shape: {labels.shape}, dtype: {labels.dtype}")
 
         # free logits otherwise it peaks backward memory
         del outputs

@@ -1,5 +1,3 @@
-# model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
-
 model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
 output_dir: tmp/doesntmatter
 tokenizer:
@@ -11,12 +9,11 @@ dataset:
   source: json
   data_files: /home/ubuntu/vanshaj/justpi.jsonl
   conversation_column: messages
-  train_on_input: True
-  packed: False
+  train_on_input: true
+  packed: false
   conversation_style: openai
   num_medusa_heads: 3
   split: train[:10%]
-
 seed: null
 shuffle: true
 model:
@@ -24,7 +21,8 @@ model:
 checkpointer:
   _component_: torchtune.training.FullModelTorchTuneCheckpointer
   checkpoint_dir: ${model_dir}
-  checkpoint_files: ["consolidated_torchtune.00.pth"]
+  checkpoint_files:
+  - consolidated_torchtune.00.pth
   recipe_checkpoint: null
   output_dir: ${output_dir}
   model_type: LLAMA3
@@ -33,7 +31,7 @@ batch_size: 1
 epochs: 1
 optimizer:
   _component_: torch.optim.AdamW
-  lr: 1.0e-04
+  lr: 0.0001
   fused: true
 loss:
   _component_: torchtune.modules.loss.MedusaCrossEntropyLoss
@@ -45,19 +43,18 @@ gradient_accumulation_steps: 1
 device: cuda
 enable_activation_checkpointing: true
 enable_activation_offloading: false
-custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']
-# - tok_embeddings
-# - output
-fsdp_cpu_offload: false #true
+custom_sharded_layers:
+- tok_embeddings
+- output
+- medusa_heads
+fsdp_cpu_offload: false
 compile: false
 optimizer_in_bwd: false
 dtype: bf16
 metric_logger:
-  # _component_: torchtune.training.metric_logging.StdoutLogger
   _component_: torchtune.training.metric_logging.WandBLogger
   log_dir: ${output_dir}/logs
   project: torchtune
-
 log_every_n_steps: 1
 log_peak_memory_stats: true
 log_level: INFO

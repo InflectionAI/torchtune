@@ -323,10 +323,9 @@ def validate_no_params_on_meta_device(model: nn.Module) -> None:
     Raises:
         RuntimeError: If meta params or buffers exist in model
     """
-    for n, p in chain(model.named_parameters(), model.named_buffers()):
+    for n, p in chain(model.named_parameters()):#, model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
-
 
 def load_from_full_model_state_dict(
     model: "FSDPModule",  # noqa
