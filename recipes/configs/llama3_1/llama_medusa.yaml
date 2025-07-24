@@ -38,7 +38,7 @@ checkpointer:
   output_dir: ${output_dir}
   model_type: LLAMA3
 resume_from_checkpoint: false  # Ensure fresh start
-batch_size: 2  # Reduced to avoid memory issues
+batch_size: 8  # Reduced to avoid memory issues
 epochs: 5
 optimizer:
   _component_: torch.optim.AdamW
@@ -50,9 +50,10 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
 max_steps_per_epoch: null
-run_val_every_n_steps: 2  # Run validation every 100 steps
-batch_size_val: 4  # Validation batch size (can be higher than training)
+run_val_every_n_steps: 1000  # Run validation every 100 steps
+batch_size_val: 16  # Validation batch size (can be higher than training)
 save_best_checkpoint: true  # Save best checkpoint based on validation loss
+val_checkpoint_dir: medusa_val_checkpoints/  # Directory for validation checkpoints
 clip_grad_norm: 1.0  # Gradient clipping for stability
 gradient_accumulation_steps: 3
 device: cuda

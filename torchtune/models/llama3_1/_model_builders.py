@@ -55,7 +55,7 @@ def llama3_1_8b_medusa() -> MedusaTransformerDecoder:
         attn_dropout=0.0,
         norm_eps=1e-5,
         rope_base=500_000,
-        medusa_num_heads=3
+        medusa_num_heads=5
     )
 
 def llama3_1_70b() -> TransformerDecoder:
