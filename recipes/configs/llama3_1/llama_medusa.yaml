@@ -22,7 +22,7 @@ dataset_val:
   train_on_input: True
   packed: False
   conversation_style: openai
-  split: train[80%:]  # Validation data
+  split: train[99%:]  # Validation data
 
 collate_fn: "torchtune.data.padded_collate_sft"
 
@@ -60,7 +60,8 @@ enable_activation_checkpointing: true  # Disable to reduce complexity
 enable_activation_offloading: false
 custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']  # Include Medusa heads in FSDP sharding
 fsdp_cpu_offload: false #true
-fsdp_reshard_after_forward: true  # Try SHARD_GRAD_OP strategy to reduce communication
+fsdp_reshard_after_forward: false  # Use SHARD_GRAD_OP to reduce communication overhead
+enable_async_checkpointing: false  # Use async checkpointing to avoid blocking
 compile: false
 optimizer_in_bwd: false
 dtype: bf16

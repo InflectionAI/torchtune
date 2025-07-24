@@ -49,6 +49,17 @@ from torchtune.modules import MedusaTransformerDecoder
 
 from tqdm import tqdm
 
+import signal
+import traceback
+import sys
+import torch.distributed as dist
+
+def dump_stack(sig, frame):
+    print(f"\n\n========== STACK TRACE RANK {dist.get_rank()} ==========")
+    traceback.print_stack(frame)
+    print("======================================================\n\n")
+
+signal.signal(signal.SIGUSR1, dump_stack)
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -210,7 +221,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             assert (
                 cfg.get("dataset_val") is not None
             ), "run_val_every_n_steps is set but dataset_val is not configured"
-        
+
         # Best checkpoint tracking
         self._best_val_loss = float('inf')
         self._save_best_checkpoint = cfg.get("save_best_checkpoint", True)
@@ -345,10 +356,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._compile_optimizer_step = compile_bool
         self._compile_scale_grads = compile_bool
         if isinstance(compile, DictConfig):
-            self._compile_model = compile.get("model", True)
-            self._compile_loss = compile.get("loss", True)
+            self._compile_model = compile.get("model", compile_bool)
+            self._compile_loss = compile.get("loss", compile_bool)
             self._compile_optimizer_step = compile.get("optimizer_step", False)
-            self._compile_scale_grads = compile.get("scale_grads", True)
+            self._compile_scale_grads = compile.get("scale_grads", compile_bool)
         if self._compile_model:
             # Capture scalar outputs is required to compile MoE
             torch._dynamo.config.capture_scalar_outputs = True
@@ -708,6 +719,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     if param_count > 0:
                         utils.log_rank_zero(self._logger, f"{name}: {type(module).__name__} ({param_count:,} params)")
             
+            # Explicitly freeze base model parameters to prevent FSDP deadlock
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, "🔒 Freezing base model parameters...")
+            
+            # Freeze all parameters except Medusa heads
+            for name, param in model.named_parameters():
+                if not name.startswith('medusa_heads'):
+                    param.requires_grad = False
+                    if self._is_rank_zero:
+                        utils.log_rank_zero(self._logger, f"🔒 Frozen: {name}")
+            
+            # Ensure Medusa heads are trainable
+            for name, param in model.medusa_heads.named_parameters():
+                param.requires_grad = True
+                if self._is_rank_zero:
+                    utils.log_rank_zero(self._logger, f"✅ Trainable: {name}")
+            
             # Move Medusa heads to device since they weren't loaded from checkpoint
             with training.set_default_dtype(self._dtype), self._device:
                 for name, param in model.medusa_heads.named_parameters():
@@ -779,6 +807,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 reshard_after_forward=reshard_after_forward,
                 dp_mesh=self.world_mesh[dp_mesh_dim_names],
             )
+            
+            # Log trainable vs frozen parameter counts for debugging
+            if self._is_rank_zero:
+                trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
+                frozen_count = sum(1 for p in model.parameters() if not p.requires_grad)
+                utils.log_rank_zero(self._logger, f"🔍 Parameter counts - Trainable: {trainable_count}, Frozen: {frozen_count}")
             
             # Debug: Check model parameters after FSDP sharding
             if self._is_rank_zero:
@@ -925,6 +959,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         else:
             # Only optimize trainable parameters
             trainable_params = [p for p in self._model.parameters() if p.requires_grad]
+            
+            if self._is_rank_zero:
+                utils.log_rank_zero(self._logger, f"🔍 Optimizer will train {len(trainable_params)} parameters")
+                total_params = len(list(self._model.parameters()))
+                utils.log_rank_zero(self._logger, f"🔍 Total model parameters: {total_params}")
+                utils.log_rank_zero(self._logger, f"🔍 Trainable percentage: {len(trainable_params)/total_params*100:.2f}%")
+            
             optimizer = config.instantiate(cfg_optimizer, trainable_params)
             if opt_state_dict:
                 training.load_from_full_optimizer_state_dict(
@@ -993,8 +1034,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Shape [b, s], needed for the loss not the model
         labels = batch.pop("labels")
 
+        # if self._is_rank_zero:
+        #     utils.log_rank_zero(self._logger, f"🔍 Starting model forward pass...")
+
+        # if self._is_rank_zero:
+        #     utils.log_rank_zero(self._logger, f"🔍 About to enter activations_handling_ctx...")
+
         with self.activations_handling_ctx:
+            # if self._is_rank_zero:
+            #     utils.log_rank_zero(self._logger, f"✅ Entered activations_handling_ctx")
+            
+            # if self._is_rank_zero:
+            #     utils.log_rank_zero(self._logger, f"🔍 About to call model forward with keys: {list(batch.keys())}")
+            
             outputs = self._model(**batch)
+
+        # if self._is_rank_zero:
+            # utils.log_rank_zero(self._logger, f"✅ Model forward pass completed")
 
         # post process for third party loss functions
         if not isinstance(self._loss_fn, SFTLoss):
@@ -1003,8 +1059,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
 
+        # if self._is_rank_zero:
+        #     utils.log_rank_zero(self._logger, f"🔍 Computing loss...")
+
         # Compute loss
         loss = self._loss_fn(outputs, labels)
+
+        # if self._is_rank_zero:
+            # utils.log_rank_zero(self._logger, f"✅ Loss computed: {loss.item()}")
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -1046,27 +1108,51 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         log_dict = {"val_loss": avg_val_loss}
 
         # Save best checkpoint if validation loss improved
+        # if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
+        #     self._best_val_loss = avg_val_loss
+        #     if self._is_rank_zero:
+        #         self._logger.info(f"New best validation loss: {avg_val_loss:.4f}")
+        #         # Save best checkpoint
+        #         self._checkpoint_client.save_checkpoint(
+        #             model=self._model,
+        #             optimizer=(
+        #                 self._optimizer
+        #                 if not self._optimizer_in_bwd
+        #                 else self._optim_ckpt_wrapper
+        #             ),
+        #             training_progress=TrainingProgress(
+        #                 seed=self.seed,
+        #                 epochs_run=self.epochs_run,
+        #                 total_epochs=self.total_epochs,
+        #                 max_steps_per_epoch=self.max_steps_per_epoch,
+        #                 dataloader_state_dict=self._dataloader.state_dict(),
+        #             ),
+        #             epoch=self.epochs_run,  # Use integer epoch number instead of string
+        #         )
+        # Always ensure all ranks are synchronized after validation
+        torch.distributed.barrier()
+        
         if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
             self._best_val_loss = avg_val_loss
+
+            # Save on rank 0 only to avoid FSDP/NCCL deadlocks
             if self._is_rank_zero:
-                self._logger.info(f"New best validation loss: {avg_val_loss:.4f}")
-                # Save best checkpoint
-                self._checkpoint_client.save_checkpoint(
-                    model=self._model,
-                    optimizer=(
-                        self._optimizer
-                        if not self._optimizer_in_bwd
-                        else self._optim_ckpt_wrapper
-                    ),
-                    training_progress=TrainingProgress(
+                training_progress=TrainingProgress(
                         seed=self.seed,
                         epochs_run=self.epochs_run,
                         total_epochs=self.total_epochs,
                         max_steps_per_epoch=self.max_steps_per_epoch,
                         dataloader_state_dict=self._dataloader.state_dict(),
-                    ),
-                    epoch=f"best_val_loss_{avg_val_loss:.4f}",
+                    )
+                self._checkpoint_client.save_checkpoint(
+                    model=self._model,
+                    optimizer=self._optimizer,
+                    training_progress=training_progress,
+                    epoch=self.epochs_run,
                 )
+            
+            # All ranks must participate in the barrier to avoid deadlock
+            torch.distributed.barrier()
 
         if self._is_rank_zero:
             self._logger.info(f"Validation loss: {avg_val_loss:.4f}")
@@ -1105,7 +1191,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._dataloader.sampler.set_epoch(curr_epoch)
 
             for idx, batch in enumerate(self._dataloader):
-                if self._is_rank_zero and idx % 10 == 0:  # Log every 10 steps
+                if self._is_rank_zero and idx % 100 == 0:  # Log every 100 steps instead of 10
                     utils.log_rank_zero(self._logger, f"📦 Processing batch {idx}")
                 
                 # Start tracking CUDA memory for active steps for just the first epoch
@@ -1130,72 +1216,46 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 # Disable context parallel manager to avoid deadlocks
+                if self._is_rank_zero and idx == 0:
+                    utils.log_rank_zero(self._logger, f"🔍 About to enter context_parallel_manager...")
+                
                 with self.context_parallel_manager(list(batch.values())):
+                    if self._is_rank_zero and idx == 0:
+                        utils.log_rank_zero(self._logger, f"✅ Entered context_parallel_manager")
+                    if self._is_rank_zero and idx == 0:
+                        utils.log_rank_zero(self._logger, f"🔍 About to call _loss_step...")
+                    
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
 
-                # For optimizer in backward, we need to normalize before calling backward
-                # This case and gradient accumulation are mutually exclusive
-                if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(num_tokens)
-                    torch.distributed.all_reduce(running_loss)
-                    current_loss = current_loss * (self.dp_degree / num_tokens)
+                    if self._is_rank_zero and idx == 0:
+                        utils.log_rank_zero(self._logger, f"✅ _loss_step completed, loss: {current_loss.item()}")
 
-                    if self._is_rank_zero:
-                        utils.log_rank_zero(self._logger, f"🔄 Starting backward pass...")
-                        utils.log_rank_zero(self._logger, f"🔍 Loss tensor info - type: {type(current_loss)}, device: {current_loss.device}, requires_grad: {current_loss.requires_grad}")
-                        # Check memory before backward
-                        if torch.cuda.is_available():
-                            utils.log_rank_zero(self._logger, f"🔍 CUDA memory before backward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-                        
-                        # Check if model is wrapped in FSDP
-                        if hasattr(self._model, '_fsdp_wrapped'):
-                            utils.log_rank_zero(self._logger, f"🔍 Model is FSDP wrapped: {self._model._fsdp_wrapped}")
-                        
-                        # Check distributed process group
-                        utils.log_rank_zero(self._logger, f"🔍 World size: {self.world_size}, Rank: {self._rank}")
+                    # For optimizer in backward, we need to normalize before calling backward
+                    # This case and gradient accumulation are mutually exclusive
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(num_tokens)
+                        torch.distributed.all_reduce(running_loss)
+                        current_loss = current_loss * (self.dp_degree / num_tokens)
 
-                    # Add timeout and error handling for backward
-                    try:
-                        import signal
-                        
-                        def timeout_handler(signum, frame):
-                            raise TimeoutError("Backward pass timed out")
-                        
-                        # Set a 30-second timeout for backward pass
-                        signal.signal(signal.SIGALRM, timeout_handler)
-                        signal.alarm(30)
-                        
-                        # Try to identify if it's an FSDP communication issue
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"🔍 About to call backward()...")
-                        
-                        current_loss.backward()
-                        
-                        # Cancel the alarm
-                        signal.alarm(0)
-                        
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"✅ Backward pass completed")
-                            if torch.cuda.is_available():
-                                utils.log_rank_zero(self._logger, f"🔍 CUDA memory after backward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-                                
-                    except TimeoutError:
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"❌ Backward pass timed out after 30 seconds")
-                            utils.log_rank_zero(self._logger, f"🔍 This suggests a communication deadlock in FSDP")
-                        raise
-                    except Exception as e:
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"❌ Error in backward pass: {e}")
-                            import traceback
-                            utils.log_rank_zero(self._logger, f"❌ Backward traceback: {traceback.format_exc()}")
-                        raise
+                    if self._is_rank_zero and idx % 100 == 0:  # Only log every 100 steps
+                        utils.log_rank_zero(self._logger, f"🔄 Starting backward pass for batch {idx}...")
+
+                    if self._is_rank_zero and idx == 0:
+                        utils.log_rank_zero(self._logger, f"🔍 About to call backward()...")
+
+                    # Simple backward pass without complex error handling
+                    current_loss.backward()
+                    
+                    if self._is_rank_zero and idx == 0:
+                        utils.log_rank_zero(self._logger, f"✅ backward() completed")
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    if self._is_rank_zero:
-                        utils.log_rank_zero(self._logger, f"🔄 Starting optimizer step...")
+                    if self._is_rank_zero and idx % 100 == 0:  # Only log every 100 steps
+                        utils.log_rank_zero(self._logger, f"🔄 Starting optimizer step for batch {idx}...")
+                    
+
                     
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
@@ -1203,22 +1263,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         # This will ensure that the logged loss matches what we're optimizing
                         torch.distributed.all_reduce(running_loss)
 
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"✅ All-reduce completed")
-
                         # Manually scale the gradients from unnormalized loss by total # of tokens
-                        self._grad_scaler(
-                            list(self._model.parameters()),
-                            self.world_size / num_tokens,
-                            False if self.parallel_dims.tp_enabled else None,
-                        )
-
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"✅ Gradient scaling completed")
+                        # Only scale gradients for trainable parameters to avoid FSDP deadlock
+                        trainable_params = [p for p in self._model.parameters() if p.requires_grad]
+                        
+                        if self._is_rank_zero and idx % 100 == 0:
+                            utils.log_rank_zero(self._logger, f"🔍 Scaling gradients for {len(trainable_params)} trainable parameters")
+                        
+                        # Only scale if there are trainable parameters
+                        if trainable_params:
+                            self._grad_scaler(
+                                trainable_params,
+                                self.world_size / num_tokens,
+                                False if self.parallel_dims.tp_enabled else None,
+                            )
 
                         if self._clip_grad_norm is not None:
-                            trainable_params = [p for p in self._model.parameters() if p.requires_grad]
-
+                            # Use the same trainable_params list we already created
                             grad_norm = torch.nn.utils.clip_grad_norm_(
                                 trainable_params,
                                 max_norm=float(self._clip_grad_norm),
@@ -1227,13 +1288,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             if isinstance(grad_norm, DTensor):
                                 grad_norm = grad_norm.full_tensor()
                         
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"🔄 Calling optimizer.step()...")
-                        
                         self._optimizer.step()
                         
-                        if self._is_rank_zero:
-                            utils.log_rank_zero(self._logger, f"✅ Optimizer step completed")
+
                         
                         self._optimizer.zero_grad(set_to_none=True)
 
