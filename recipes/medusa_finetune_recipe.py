@@ -9,6 +9,9 @@ import sys
 import time
 from pathlib import Path
 
+# Set CUDA visible devices BEFORE importing torch
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+
 from functools import partial
 from typing import Any, Optional, Union
 from warnings import warn
@@ -50,6 +53,11 @@ from torchtune.modules import MedusaTransformerDecoder
 
 from tqdm import tqdm
 
+# Clear CUDA cache at startup
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print("Cleared CUDA cache at startup")
+
 import signal
 import traceback
 import sys
@@ -61,20 +69,6 @@ def dump_stack(sig, frame):
     print("======================================================\n\n")
 
 signal.signal(signal.SIGUSR1, dump_stack)
-import os
-import sys
-import subprocess
-
-# if "PYSPY_ACTIVE" not in os.environ:
-#     os.environ["PYSPY_ACTIVE"] = "1"
-#     rank = int(os.environ.get("LOCAL_RANK", "0"))
-#     flamegraph_path = f"profile_rank{rank}.svg"
-
-#     # Relaunch the script under py-spy
-#     subprocess.run([
-#         "py-spy", "record", "-o", flamegraph_path, "--", sys.executable
-#     ] + sys.argv)
-#     sys.exit(0)
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -944,25 +938,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 utils.log_rank_zero(self._logger, "=== Model Module Names ===")
                 for name, module in model.named_modules():
                     param_count = sum(p.numel() for p in module.parameters())
-                    if param_count > 0:
-                        utils.log_rank_zero(self._logger, f"{name}: {type(module).__name__} ({param_count:,} params)")
+                    # if param_count > 0:
+                    #     utils.log_rank_zero(self._logger, f"{name}: {type(module).__name__} ({param_count:,} params)")
             
             # Explicitly freeze base model parameters to prevent FSDP deadlock
             if self._is_rank_zero:
-                utils.log_rank_zero(self._logger, "🔒 Freezing base model parameters...")
+                utils.log_rank_zero(self._logger, "Freezing base model parameters...")
             
             # Freeze all parameters except Medusa heads
             for name, param in model.named_parameters():
                 if not name.startswith('medusa_heads'):
                     param.requires_grad = False
-                    if self._is_rank_zero:
-                        utils.log_rank_zero(self._logger, f"🔒 Frozen: {name}")
+                    # if self._is_rank_zero:
+                        # utils.log_rank_zero(self._logger, f" Frozen: {name}")
             
             # Ensure Medusa heads are trainable
             for name, param in model.medusa_heads.named_parameters():
                 param.requires_grad = True
-                if self._is_rank_zero:
-                    utils.log_rank_zero(self._logger, f"✅ Trainable: {name}")
             
             # Move Medusa heads to device since they weren't loaded from checkpoint
             with training.set_default_dtype(self._dtype), self._device:
@@ -998,12 +990,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             setattr(parent_module, attr_name, new_param)
                         else:
                             setattr(model.medusa_heads, attr_name, new_param)
-                        utils.log_rank_zero(self._logger, f"Initialized Medusa head parameter: {name}")
         
         # Apply Fully Sharded Data Parallelism to the model AFTER Medusa heads are initialized
         if self.parallel_dims.dp_shard_enabled:
             if self._is_rank_zero:
-                utils.log_rank_zero(self._logger, "🔧 Applying single FSDP wrapping to model (including Medusa heads)...")
+                utils.log_rank_zero(self._logger, "Applying FSDP wrapping to model...")
             
             # Always apply FSDP sharding first, regardless of activation checkpointing settings
             # Create shard conditions for both transformer layers and custom sharded layers
@@ -1094,7 +1085,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # We'll clean this up as soon as testing of AC is complete
         if (not enable_activation_checkpointing) and (ac_mode is not None):
             if self._is_rank_zero:
-                utils.log_rank_zero(self._logger, "🔧 Applying selective activation checkpointing after FSDP sharding...")
+                utils.log_rank_zero(self._logger, "Applying selective activation checkpointing...")
             apply_selective_activation_checkpointing(
                 model,
                 ac_mode,
@@ -1108,7 +1099,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
-        print("Successful")
         utils.log_rank_zero(
             self._logger,
             f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
@@ -1189,10 +1179,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             trainable_params = [p for p in self._model.parameters() if p.requires_grad]
             
             if self._is_rank_zero:
-                utils.log_rank_zero(self._logger, f"🔍 Optimizer will train {len(trainable_params)} parameters")
+                utils.log_rank_zero(self._logger, f"Optimizer will train {len(trainable_params)} parameters")
                 total_params = len(list(self._model.parameters()))
-                utils.log_rank_zero(self._logger, f"🔍 Total model parameters: {total_params}")
-                utils.log_rank_zero(self._logger, f"🔍 Trainable percentage: {len(trainable_params)/total_params*100:.2f}%")
+                utils.log_rank_zero(self._logger, f"Total model parameters: {total_params}")
+                utils.log_rank_zero(self._logger, f"Trainable percentage: {len(trainable_params)/total_params*100:.2f}%")
             
             optimizer = config.instantiate(cfg_optimizer, trainable_params)
             if opt_state_dict:
@@ -1262,23 +1252,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Shape [b, s], needed for the loss not the model
         labels = batch.pop("labels")
 
-        # if self._is_rank_zero:
-        #     utils.log_rank_zero(self._logger, f"🔍 Starting model forward pass...")
-
-        # if self._is_rank_zero:
-        #     utils.log_rank_zero(self._logger, f"🔍 About to enter activations_handling_ctx...")
-
         with self.activations_handling_ctx:
-            # if self._is_rank_zero:
-            #     utils.log_rank_zero(self._logger, f"✅ Entered activations_handling_ctx")
-            
-            # if self._is_rank_zero:
-            #     utils.log_rank_zero(self._logger, f"🔍 About to call model forward with keys: {list(batch.keys())}")
-            
             outputs = self._model(**batch)
-
-        # if self._is_rank_zero:
-            # utils.log_rank_zero(self._logger, f"✅ Model forward pass completed")
 
         # post process for third party loss functions
         if not isinstance(self._loss_fn, SFTLoss):
@@ -1287,14 +1262,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
 
-        # if self._is_rank_zero:
-        #     utils.log_rank_zero(self._logger, f"🔍 Computing loss...")
-
         # Compute loss
         loss = self._loss_fn(outputs, labels)
-
-        # if self._is_rank_zero:
-            # utils.log_rank_zero(self._logger, f"✅ Loss computed: {loss.item()}")
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -1397,9 +1366,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._dataloader.sampler.set_epoch(curr_epoch)
 
             for idx, batch in enumerate(self._dataloader):
-                if self._is_rank_zero and idx % 100 == 0:  # Log every 100 steps instead of 10
-                    utils.log_rank_zero(self._logger, f"📦 Processing batch {idx}")
-                
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1421,21 +1387,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                # Disable context parallel manager to avoid deadlocks
-                if self._is_rank_zero and idx == 0:
-                    utils.log_rank_zero(self._logger, f"🔍 About to enter context_parallel_manager...")
-                
                 with self.context_parallel_manager(list(batch.values())):
-                    if self._is_rank_zero and idx == 0:
-                        utils.log_rank_zero(self._logger, f"✅ Entered context_parallel_manager")
-                    if self._is_rank_zero and idx == 0:
-                        utils.log_rank_zero(self._logger, f"🔍 About to call _loss_step...")
-                    
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
-
-                    if self._is_rank_zero and idx == 0:
-                        utils.log_rank_zero(self._logger, f"✅ _loss_step completed, loss: {current_loss.item()}")
 
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
@@ -1444,25 +1398,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         torch.distributed.all_reduce(running_loss)
                         current_loss = current_loss * (self.dp_degree / num_tokens)
 
-                    if self._is_rank_zero and idx % 100 == 0:  # Only log every 100 steps
-                        utils.log_rank_zero(self._logger, f"🔄 Starting backward pass for batch {idx}...")
-
-                    if self._is_rank_zero and idx == 0:
-                        utils.log_rank_zero(self._logger, f"🔍 About to call backward()...")
-
                     # Simple backward pass without complex error handling
                     current_loss.backward()
-                    
-                    if self._is_rank_zero and idx == 0:
-                        utils.log_rank_zero(self._logger, f"✅ backward() completed")
 
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    if self._is_rank_zero and idx % 100 == 0:  # Only log every 100 steps
-                        utils.log_rank_zero(self._logger, f"🔄 Starting optimizer step for batch {idx}...")
-                    
-
-                    
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
                         torch.distributed.all_reduce(num_tokens)
@@ -1472,9 +1412,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         # Only scale gradients for trainable parameters to avoid FSDP deadlock
                         trainable_params = [p for p in self._model.parameters() if p.requires_grad]
-                        
-                        if self._is_rank_zero and idx % 100 == 0:
-                            utils.log_rank_zero(self._logger, f"🔍 Scaling gradients for {len(trainable_params)} trainable parameters")
                         
                         # Only scale if there are trainable parameters
                         if trainable_params:
@@ -1495,9 +1432,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 grad_norm = grad_norm.full_tensor()
                         
                         self._optimizer.step()
-                        
-
-                        
                         self._optimizer.zero_grad(set_to_none=True)
 
                     # Update the number of steps when the weights are updated
