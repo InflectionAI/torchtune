@@ -60,6 +60,20 @@ def dump_stack(sig, frame):
     print("======================================================\n\n")
 
 signal.signal(signal.SIGUSR1, dump_stack)
+import os
+import sys
+import subprocess
+
+# if "PYSPY_ACTIVE" not in os.environ:
+#     os.environ["PYSPY_ACTIVE"] = "1"
+#     rank = int(os.environ.get("LOCAL_RANK", "0"))
+#     flamegraph_path = f"profile_rank{rank}.svg"
+
+#     # Relaunch the script under py-spy
+#     subprocess.run([
+#         "py-spy", "record", "-o", flamegraph_path, "--", sys.executable
+#     ] + sys.argv)
+#     sys.exit(0)
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -1107,52 +1121,34 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         log_dict = {"val_loss": avg_val_loss}
 
-        # Save best checkpoint if validation loss improved
-        # if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
-        #     self._best_val_loss = avg_val_loss
-        #     if self._is_rank_zero:
-        #         self._logger.info(f"New best validation loss: {avg_val_loss:.4f}")
-        #         # Save best checkpoint
-        #         self._checkpoint_client.save_checkpoint(
-        #             model=self._model,
-        #             optimizer=(
-        #                 self._optimizer
-        #                 if not self._optimizer_in_bwd
-        #                 else self._optim_ckpt_wrapper
-        #             ),
-        #             training_progress=TrainingProgress(
-        #                 seed=self.seed,
-        #                 epochs_run=self.epochs_run,
-        #                 total_epochs=self.total_epochs,
-        #                 max_steps_per_epoch=self.max_steps_per_epoch,
-        #                 dataloader_state_dict=self._dataloader.state_dict(),
-        #             ),
-        #             epoch=self.epochs_run,  # Use integer epoch number instead of string
-        #         )
+     
         # Always ensure all ranks are synchronized after validation
         torch.distributed.barrier()
         
         if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
             self._best_val_loss = avg_val_loss
 
-            # Save on rank 0 only to avoid FSDP/NCCL deadlocks
-            if self._is_rank_zero:
-                training_progress=TrainingProgress(
-                        seed=self.seed,
-                        epochs_run=self.epochs_run,
-                        total_epochs=self.total_epochs,
-                        max_steps_per_epoch=self.max_steps_per_epoch,
-                        dataloader_state_dict=self._dataloader.state_dict(),
-                    )
-                self._checkpoint_client.save_checkpoint(
-                    model=self._model,
-                    optimizer=self._optimizer,
-                    training_progress=training_progress,
-                    epoch=self.epochs_run,
-                )
-            
-            # All ranks must participate in the barrier to avoid deadlock
+            # Save checkpoint using the model and optimizer directly
+            # The checkpoint client will handle the sharding internally
+            training_progress = TrainingProgress(
+                seed=self.seed,
+                epochs_run=self.epochs_run,
+                total_epochs=self.total_epochs,
+                max_steps_per_epoch=self.max_steps_per_epoch,
+                dataloader_state_dict=self._dataloader.state_dict(),
+            )
+
+            # Save checkpoint - all ranks participate
+            self._checkpoint_client.save_checkpoint(
+                model=self._model,
+                optimizer=self._optimizer,
+                training_progress=training_progress,
+                epoch=self.epochs_run,
+            )
+
+            # All ranks must synchronize here to avoid deadlocks
             torch.distributed.barrier()
+
 
         if self._is_rank_zero:
             self._logger.info(f"Validation loss: {avg_val_loss:.4f}")
@@ -1385,6 +1381,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     break
 
             self.epochs_run += 1
+            
+            # Save checkpoint using the model and optimizer directly
+            # The checkpoint client will handle the sharding internally
             self._checkpoint_client.save_checkpoint(
                 model=self._model,
                 optimizer=(
