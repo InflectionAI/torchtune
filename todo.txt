@@ -1,0 +1,4 @@
+1. check chat template accepts/parses prompts in the same format
+2. also what about the attention mask
+3. how does medusa finetuning take place? is it just next token prediction?
+4. What decoding strategy was used in the finetuning recipe? Is it in the loss function?

@@ -1,6 +1,6 @@
 # model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
 
-model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
+model_dir: /mnt/vast/share/inf2-training/models/open_source/Meta-Llama-3.1-8B-Instruct/original
 output_dir: medusa_checkpoints/
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
@@ -8,7 +8,7 @@ tokenizer:
 dataset:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
-  data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  data_files: /mnt/vast/home/vanshaj/justpi_sft_identity_fixed_nosearch_nosys.jsonl
   conversation_column: messages
   train_on_input: True
   packed: False
@@ -17,12 +17,12 @@ dataset:
 dataset_val:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
-  data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  data_files: /mnt/vast/home/vanshaj/justpi_sft_identity_fixed_nosearch_nosys.jsonl
   conversation_column: messages
   train_on_input: True
   packed: False
   conversation_style: openai
-  split: train[99%:]  # Validation data
+  split: train[90%:]  # Validation data
 
 collate_fn: "torchtune.data.padded_collate_sft"
 
@@ -33,12 +33,13 @@ model:
 checkpointer:
   _component_: torchtune.training.FullModelTorchTuneCheckpointer
   checkpoint_dir: ${model_dir}
-  checkpoint_files: ["consolidated_torchtune.00.pth"]
+  checkpoint_files: ["consolidated_torchtune_converted.00.pth"]
   recipe_checkpoint: null
   output_dir: ${output_dir}
   model_type: LLAMA3
 resume_from_checkpoint: false  # Ensure fresh start
-batch_size: 8  # Reduced to avoid memory issues
+batch_size: 2  # Reduced to avoid memory issues
+gradient_accumulation_steps: 4
 epochs: 5
 optimizer:
   _component_: torch.optim.AdamW
@@ -50,12 +51,11 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 20
 max_steps_per_epoch: null
-run_val_every_n_steps: 1000  # Run validation every 100 steps
+run_val_every_n_steps: 200  # Run validation every 100 steps
 batch_size_val: 16  # Validation batch size (can be higher than training)
 save_best_checkpoint: true  # Save best checkpoint based on validation loss
 val_checkpoint_dir: medusa_val_checkpoints/  # Directory for validation checkpoints
 clip_grad_norm: 1.0  # Gradient clipping for stability
-gradient_accumulation_steps: 3
 device: cuda
 enable_activation_checkpointing: true  # Disable to reduce complexity
 enable_activation_offloading: false

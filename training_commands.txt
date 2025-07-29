@@ -1,1 +1,5 @@
 ./inf2_training/scripts/launch.sh --recipe medusa_heads.py --config llama3_1/llama_medusa --nodes 4 --gpus-per-node 8 --experiment hackathon-medusa
+
+
+
+torchrun --nproc_per_node=2 recipes/medusa_finetune_recipe.py --config recipes/configs/llama3_1/llama_medusa.yaml

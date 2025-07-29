@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 # Set CUDA visible devices BEFORE importing torch
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
 
 from functools import partial
 from typing import Any, Optional, Union
@@ -1288,6 +1287,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ).sum()
 
                 # Compute loss
+                # Cross-enropy already applied reduction is sum so apparently no need to multiply by current_num_tokens again
                 val_loss = self._loss_step(batch) * current_num_tokens
 
                 total_val_loss += val_loss
@@ -1304,10 +1304,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         log_dict = {"val_loss": avg_val_loss}
 
-     
-        # Always ensure all ranks are synchronized after validation
-        torch.distributed.barrier()
-        
         if self._save_best_checkpoint and avg_val_loss < self._best_val_loss:
             self._best_val_loss = avg_val_loss
 
@@ -1325,12 +1321,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             checkpoint_id = (1+self.epochs_run) * 1000000 + self.global_step
             self._save_validation_checkpoint(training_progress, checkpoint_id)
 
-            # All ranks must synchronize here to avoid deadlocks
-            torch.distributed.barrier()
-
-
         if self._is_rank_zero:
             self._logger.info(f"Validation loss: {avg_val_loss:.4f}")
+            self._logger.info(f"Validation tokens: {total_val_tokens.item():.0f}")
+            self._logger.info(f"Validation batches: {len(self._val_dataloader)}")
+            
+            # Log GPU metrics during validation
+            if self._device.type == "cuda":
+                gpu_memory_allocated = torch.cuda.memory_allocated(self._device) / (1024**3)  # GB
+                gpu_memory_reserved = torch.cuda.memory_reserved(self._device) / (1024**3)   # GB
+                self._logger.info(f"GPU memory during validation: {gpu_memory_allocated:.2f}GB allocated, {gpu_memory_reserved:.2f}GB reserved")
+            
             self._metric_logger.log_dict(
                 log_dict,
                 step=self.global_step,
@@ -1388,6 +1389,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 with self.context_parallel_manager(list(batch.values())):
+                    # Cross-enropy already applied reduction is sum so apparently no need to multiply by current_num_tokens again
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
 
@@ -1483,10 +1485,44 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             )
                         if self._clip_grad_norm is not None:
                             log_dict.update({"grad_norm": grad_norm})
+                        
+                        # Log GPU memory and utilization metrics
+                        if self._device.type == "cuda":
+                            # GPU memory stats
+                            gpu_memory_allocated = torch.cuda.memory_allocated(self._device) / (1024**3)  # GB
+                            gpu_memory_reserved = torch.cuda.memory_reserved(self._device) / (1024**3)   # GB
+                            gpu_memory_max_allocated = torch.cuda.max_memory_allocated(self._device) / (1024**3)  # GB
+                            
+                            # Get GPU utilization (requires nvidia-ml-py3 or pynvml)
+                            try:
+                                import pynvml
+                                pynvml.nvmlInit()
+                                handle = pynvml.nvmlDeviceGetHandleByIndex(self._device.index)
+                                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                                gpu_utilization = gpu_util.gpu
+                                gpu_memory_utilization = gpu_util.memory
+                            except ImportError:
+                                # Fallback if pynvml not available
+                                gpu_utilization = 0
+                                gpu_memory_utilization = 0
+                            
+                            log_dict.update({
+                                "gpu_memory_allocated_gb": gpu_memory_allocated,
+                                "gpu_memory_reserved_gb": gpu_memory_reserved,
+                                "gpu_memory_max_allocated_gb": gpu_memory_max_allocated,
+                                "gpu_utilization_percent": gpu_utilization,
+                                "gpu_memory_utilization_percent": gpu_memory_utilization,
+                            })
+                        
+                        # Log training loss details for debugging
+                        if self._is_rank_zero:
+                            self._logger.info(f"Training loss: {loss_to_log:.4f} (step: {self.global_step})")
+                        
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
                         )
+                        
 
                     # Reset running stats for the next step
                     running_loss = 0
