@@ -80,10 +80,13 @@ class TransformerSelfAttentionLayer(nn.Module):
         See :func:~torchtune.modules.TransformerDecoder.caches_are_enabled`.
         """
         return self.attn.cache_enabled
-
+    
     def reset_cache(self):
         """Reset the key value caches."""
         self.attn.reset_cache()
+
+    def revert_cache_to_valid_length(self, valid_cache_len):
+        self.attn.revert_cache_to_valid_length(valid_cache_len)
 
     def forward(
         self,
@@ -216,6 +219,9 @@ class TransformerCrossAttentionLayer(nn.Module):
     def reset_cache(self):
         """Reset the key value caches."""
         self.attn.reset_cache()
+
+    def revert_cache_to_valid_length(self, valid_cache_len):
+        self.attn.revert_cache_to_valid_length(valid_cache_len)
 
     def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Some tokens in x may not attend to any encoder inputs
@@ -490,6 +496,10 @@ class TransformerDecoder(nn.Module):
 
         for layer in self.layers:
             layer.reset_cache()
+    
+    def revert_cache_to_valid_length(self, valid_cache_len):
+        for layer in self.layers:
+            layer.revert_cache_to_valid_length(self, valid_cache_len)
 
     @deprecated("Please use self.skip_output_layer=True and use a linear loss instead")
     def chunked_output(self, last_hidden_state: torch.Tensor) -> list[torch.Tensor]:
@@ -640,7 +650,6 @@ class TransformerDecoder(nn.Module):
             - d_e: encoder embed dim
             - m_s: max seq len
         """
-
         self._validate_inputs(
             tokens=tokens,
             mask=mask,

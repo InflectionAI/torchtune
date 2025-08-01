@@ -52,9 +52,16 @@ class KVCache(nn.Module):
         return self.cache_pos[0].item()
 
     """This function is to be called after verifying medusa head predictions to revert cache state to valid_cache_len by evicting the invalid medusa predictions"""
-    def evict_from_cache(self, valid_cache_len):
-        len_kv_remove = self.size - valid_cache_len
-        self.cache_pos.subtract_(len_kv_remove)
+    def revert_cache_to_valid_length(self, valid_cache_len):
+        len_to_remove = self.size - valid_cache_len
+        # Clear the invalid cache data
+        if len_to_remove > 0:
+            start_pos = valid_cache_len
+            end_pos = self.size
+            self.k_cache[:, :, start_pos:end_pos] = 0
+            self.v_cache[:, :, start_pos:end_pos] = 0
+        # Adjust the cache position pointer
+        self.cache_pos.subtract_(len_to_remove)
 
     def update(
         self, k_val: torch.Tensor, v_val: torch.Tensor

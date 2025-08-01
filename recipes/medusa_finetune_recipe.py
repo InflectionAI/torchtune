@@ -346,6 +346,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         Setup the recipe. This includes training state (if resume_from_checkpoint is True),
         model, tokenizer, loss, optimizer, lr scheduler, sampler, and dataloader.
         """
+
         if self.fsdp_cpu_offload:
             # Utilize all available CPU cores for intra-op parallelism. This provides ~2x
             # speed up when benchmarking fused AdamW on CPU
@@ -463,6 +464,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             batch_size=cfg.batch_size,
             collate_fn=collate_name,
         )
+        # breakpoint()
+        # for batch in self._dataloader:
+        #     tokens = batch['tokens']
+        #     print("tokens:", tokens)
 
         # Setup validation dataloader if validation dataset is provided
         self._val_dataloader = None
@@ -510,214 +515,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             else max(cfg.batch_size, self._val_dataloader.batch_size)
         )
 
-    def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
-        """
-        Updates the recipe state from checkpoint.
-        """
-        try:
-            self.epochs_run = ckpt_dict[training.EPOCHS_KEY]
 
-            # on mismatch, warn the user and prevent the override
-            if self.seed != ckpt_dict[training.SEED_KEY]:
-                warn(
-                    message=(
-                        "Config value for seed does not match the checkpoint value, "
-                        f"using the checkpoint value: {ckpt_dict[training.SEED_KEY]}"
-                    )
-                )
-                self.seed = ckpt_dict[training.SEED_KEY]
-            if self.max_steps_per_epoch != ckpt_dict[training.MAX_STEPS_KEY]:
-                warn(
-                    message=(
-                        "Config value for max_steps_per_epoch does not match the checkpoint value, "
-                        f"using the checkpoint value: {ckpt_dict[training.MAX_STEPS_KEY]}"
-                    )
-                )
-                self.max_steps_per_epoch = ckpt_dict[training.MAX_STEPS_KEY]
-
-            # on mismatch, warn the user but allow the override
-            if self.total_epochs != ckpt_dict[training.TOTAL_EPOCHS_KEY]:
-                warn(
-                    message=(
-                        "Config value for total_epochs does not match the checkpoint value, "
-                        f"using the config value: {self.total_epochs}"
-                    )
-                )
-
-        except KeyError as e:
-            raise KeyError(
-                "Checkpoint does not contain the required keys needed for updating recipe state. "
-                "Are you sure you passed in the right recipe checkpoint?"
-            ) from e
-
-    def setup(self, cfg: DictConfig) -> None:
-        """
-        Setup the recipe. This includes training state (if resume_from_checkpoint is True),
-        model, tokenizer, loss, optimizer, lr scheduler, sampler, and dataloader.
-        """
-        if self.fsdp_cpu_offload:
-            # Utilize all available CPU cores for intra-op parallelism. This provides ~2x
-            # speed up when benchmarking fused AdamW on CPU
-            training.set_torch_num_threads()
-
-        if self._is_rank_zero:
-            self._metric_logger = config.instantiate(cfg.metric_logger)
-            # log config with parameter override
-            self._metric_logger.log_config(cfg)
-
-        # Load the base model
-        checkpoint_dict = self._checkpoint_client.load_base_checkpoint()
-
-        compile = cfg.get("compile")
-        compile_bool = bool(compile)
-        self._compile_backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
-
-        self._compile_model = compile_bool
-        self._compile_loss = compile_bool
-        self._compile_optimizer_step = compile_bool
-        self._compile_scale_grads = compile_bool
-        if isinstance(compile, DictConfig):
-            self._compile_model = compile.get("model", compile_bool)
-            self._compile_loss = compile.get("loss", compile_bool)
-            self._compile_optimizer_step = compile.get("optimizer_step", False)
-            self._compile_scale_grads = compile.get("scale_grads", compile_bool)
-        if self._compile_model:
-            # Capture scalar outputs is required to compile MoE
-            torch._dynamo.config.capture_scalar_outputs = True
-
-        # This indirection is needed to apply torch.compile to scale_grads step.
-        self._grad_scaler = training.scale_grads_
-        if self._compile_scale_grads:
-            self._grad_scaler = torch.compile(
-                self._grad_scaler, backend=self._compile_backend
-            )
-
-        self._model = self._setup_model(
-            cfg_model=cfg.model,
-            enable_activation_checkpointing=self._enable_activation_checkpointing,
-            enable_activation_offloading=self._enable_activation_offloading,
-            activation_offloading_use_streams=self._activation_offloading_use_streams,
-            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-            fsdp_cpu_offload=self.fsdp_cpu_offload,
-            reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
-            model_state_dict=checkpoint_dict[training.MODEL_KEY],
-            ac_mode=cfg.get("ac_mode", None),
-            ac_option=cfg.get("ac_option", None),
-        )
-        self._tokenizer = config.instantiate(cfg.tokenizer)
-
-        if cfg.get("resize_token_embeddings", False):
-            resize_token_embeddings(self._model, self._tokenizer.vocab_size)
-
-        self._optimizer = self._setup_optimizer(
-            cfg_optimizer=cfg.optimizer,
-            optimizer_in_bwd=self._optimizer_in_bwd,
-            opt_state_dict=(
-                checkpoint_dict[training.OPT_KEY]
-                if training.OPT_KEY in checkpoint_dict
-                else None
-            ),
-        )
-        if self._compile_optimizer_step:
-            if self._optimizer_in_bwd:
-                raise ValueError(
-                    "optimizer_in_bwd not supported with compiling the optimizer step"
-                )
-            self._optimizer.step = torch.compile(
-                self._optimizer.step,
-                backend=self._compile_backend,
-            )
-
-        if self._resume_from_checkpoint:
-            # If async checkpointing is enabled, intermediate checkpoints are saved asynchronously
-            # using the DistributedCheckpointer.
-            # Therefore the recipe needs to load the distributed checkpoint to restore the training
-            # progress.
-            if self._enable_async_checkpointing:
-                try:
-                    checkpoint_dict = (
-                        self._checkpoint_client.load_distributed_checkpoint(
-                            self._model,
-                            (
-                                self._optim_ckpt_wrapper
-                                if self._optimizer_in_bwd
-                                else self._optimizer
-                            ),
-                        )
-                    )
-                except Exception as e:
-                    self._logger.warning(
-                        f"Failed to load distributed checkpoint: {e}. Training will start from the base checkpoint."
-                    )
-
-            # Update the recipe state from the checkpoint state dict.
-            self._update_recipe_state(checkpoint_dict)
-
-        # initialize loss
-        self._loss_fn = config.instantiate(cfg.loss)
-        if isinstance(self._loss_fn, SFTLoss):
-            self._loss_fn.set_model_output(self._model)
-
-        if self._compile_loss:
-            training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
-
-        utils.log_rank_zero(self._logger, "Loss is initialized.")
-
-        # sampler and dataloader depend on the tokenizer and loss_fn and should be
-        # setup after both of these are initialized
-        collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
-        self._dataloader = self._setup_data(
-            cfg_dataset=cfg.dataset,
-            shuffle=cfg.shuffle,
-            batch_size=cfg.batch_size,
-            collate_fn=collate_name,
-        )
-
-        # Setup validation dataloader if validation dataset is provided
-        self._val_dataloader = None
-        if cfg.get("dataset_val") is not None:
-            batch_size_val = cfg.get("batch_size_val", cfg.batch_size)
-            self._val_dataloader = self._setup_data(
-                cfg_dataset=cfg.dataset_val,
-                batch_size=batch_size_val,
-                collate_fn=collate_name,
-                shuffle=False,
-            )
-
-        # Finally update the recipe state which can only be correctly set after all of the
-        # other components have been initialized and updated.
-        #
-        # Number of training steps in each epoch depends on the number of batches produced
-        # by the dataloader, the max_steps_per_epoch param set by the user and the
-        # gradient_accumulation_steps param. This value is used for logging and tracking
-        # training state. The computation should happen after the dataloader has been setup
-        self._steps_per_epoch = (
-            len(self._dataloader) // self._gradient_accumulation_steps
-        )
-        if (
-            self.max_steps_per_epoch is not None
-            and self.max_steps_per_epoch < self._steps_per_epoch
-        ):
-            self._steps_per_epoch = self.max_steps_per_epoch
-        self.global_step = self.epochs_run * self._steps_per_epoch
-
-        # Setup lr scheduler
-        self._lr_scheduler = self._setup_lr_scheduler(
-            cfg_lr_scheduler=cfg.get("lr_scheduler", None),
-            num_training_steps=self.total_epochs * self._steps_per_epoch,
-            last_epoch=self.global_step - 1,
-        )
-
-        # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
-        # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
-        self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
-
-        # Used to ignore labels for loss computation
-        bsz_cache = (
-            cfg.batch_size
-            if self._val_dataloader is None
-            else max(cfg.batch_size, self._val_dataloader.batch_size)
-        )
 
     def _setup_lr_scheduler(
         self,
@@ -1244,7 +1042,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
         )
-
+        
         return dataloader
 
     def _loss_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1260,7 +1058,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             outputs = outputs.reshape(-1, outputs.size(-1))
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
-
+        breakpoint()
         # Compute loss
         loss = self._loss_fn(outputs, labels)
 

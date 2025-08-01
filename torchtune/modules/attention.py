@@ -145,7 +145,7 @@ class MultiHeadAttention(nn.Module):
         self.cache_enabled = False
 
     def setup_cache(
-        self, batch_size: int, dtype: torch.dtype, ww: int
+        self, batch_size: int, dtype: torch.dtype, max_seq_len: int
     ) -> None:
         """Setup key value caches for attention calculation. If called
         after kv_cache is already setup, this will be skipped.
@@ -169,6 +169,9 @@ class MultiHeadAttention(nn.Module):
                 dtype=dtype,
             )
             self.cache_enabled = True
+
+    def revert_cache_to_valid_length(self, valid_cache_len):
+        self.kv_cache.revert_cache_to_valid_length(valid_cache_len)
 
     def reset_cache(self):
         """Reset the key value caches."""
