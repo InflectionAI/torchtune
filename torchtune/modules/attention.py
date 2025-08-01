@@ -125,7 +125,8 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.is_causal = is_causal
-
+        
+        self.should_print = False # DEBUG flag
         # Set layers
         self.kv_cache = kv_cache
         self.q_proj = q_proj
@@ -250,6 +251,19 @@ class MultiHeadAttention(nn.Module):
         # Normalize q
         if self.q_norm is not None:
             q = self.q_norm(q)
+        
+        # DEBUG
+        # Verify consistency of kv caching
+        if self.should_print:
+            print("______________________________________________________")
+            print("Before")
+            print("______________________________________________________")
+
+            print("self.kv_cache.size: ", self.kv_cache.size)
+            print("self.kv_cache.shape: ", self.kv_cache.k_cache.shape)
+            print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
+            print("input_pos: ", input_pos)
+            # print("self.kv_cache.k_cache: ", self.kv_cache.k_cache)
 
         if y is None:
             if self.kv_cache is None or not self.cache_enabled:
@@ -303,4 +317,14 @@ class MultiHeadAttention(nn.Module):
 
         # reshape the output to be the same shape as the input
         output = output.transpose(1, 2).contiguous().view(b, s_x, -1)
+
+        # DEBUG
+        # Verify consistency of kv caching
+        if self.should_print:
+            print("______________________________________________________")
+            print("After")
+            print("______________________________________________________")
+            print("self.kv_cache.size: ", self.kv_cache.size)
+            print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
+
         return self.output_proj(output)

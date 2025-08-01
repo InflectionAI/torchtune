@@ -13,7 +13,6 @@ from torchtune.modules.attention_utils import _MaskType
 
 from torchtune.utils import deprecated
 
-
 class TransformerSelfAttentionLayer(nn.Module):
     """
     Transformer layer derived from the Llama2 model. Normalization is applied before the attention **and** FF layer.
@@ -133,6 +132,7 @@ class TransformerSelfAttentionLayer(nn.Module):
             bsz, seq_len, *_ = h.shape
             mask = self.mask_mod(mask=mask, bsz=bsz, seq_len=seq_len)
         attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
+        
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = self.sa_scale(attn_out) + x
 
@@ -499,7 +499,7 @@ class TransformerDecoder(nn.Module):
     
     def revert_cache_to_valid_length(self, valid_cache_len):
         for layer in self.layers:
-            layer.revert_cache_to_valid_length(self, valid_cache_len)
+            layer.revert_cache_to_valid_length(valid_cache_len)
 
     @deprecated("Please use self.skip_output_layer=True and use a linear loss instead")
     def chunked_output(self, last_hidden_state: torch.Tensor) -> list[torch.Tensor]:

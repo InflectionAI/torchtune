@@ -12,6 +12,8 @@ from torchtune.models.llama3._tokenizer import Llama3Tokenizer
 from torchtune.datasets._chat import chat_dataset
 import gc
 
+import sys, pdb, traceback; sys.excepthook = lambda t, v, tb: (traceback.print_exception(t, v, tb), pdb.post_mortem(tb))
+
 global tokenizer
 def load_data(dataset_dir, tokenizer_dir, bs = 1):
     global tokenizer
@@ -69,7 +71,7 @@ def format_input(input_tokens):
     return part1
 
 def decode(x):
-    return tokenizer.decode(x.tolist()[0], skip_special_tokens = False )
+    return tokenizer.decode(x.flatten().tolist(), skip_special_tokens = False )
 
 def create_causal_mask(
     batch_size: int,
@@ -77,7 +79,7 @@ def create_causal_mask(
     cached_seq_len: int,   # Current KV cache length
     max_cache_size,
     device: torch.device,
-    dtype: torch.dtype = torch.bool
+    dtype: torch.dtype
 ) -> torch.Tensor:
     """
     Create a causal mask for Medusa evaluation with KV cache.
@@ -105,28 +107,35 @@ def create_causal_mask(
     )
     suffix_mask_dim = max_cache_size - mask.shape[-1]
     # breakpoint()
-    mask_suffix = torch.zeros((current_seq_len , suffix_mask_dim), device = device)
+    mask_suffix = torch.zeros((current_seq_len , suffix_mask_dim), device = device, dtype = dtype)
     full_mask = torch.cat((mask, mask_suffix), dim = -1) 
     # Expand to batch dimension
     full_mask = full_mask.unsqueeze(0)  # [1, current_seq_len, total_seq_len]
-    full_mask = full_mask.expand(batch_size, current_seq_len, max_cache_size)
-    
+    # full_mask = full_mask.expand(batch_size, current_seq_len, max_cache_size)
     return full_mask
 
 
-def evaluate(dataloader, model, tokens_to_generate = 10):
+def evaluate(dataloader, model, tokens_to_generate = 100):
+    predictions = []
     # initialize kv cache
     for batch in dataloader:
         model.reset_caches()
-        
+        model_dtype = next(model.parameters()).dtype
         # empty kv cache
         input_tokens = batch['tokens'].to(device)
-        input_prompt = format_input(input_tokens)
+        input_prompt = format_input(input_tokens) # bs, seq
+        # DEBUG
+        input_prompt = input_prompt#[:, :4] 
+
+        print('input_prompt:', decode(input_prompt))
+
         bs = input_prompt.shape[0]; curr_seq_len = input_prompt.shape[1] 
         curr_kv_len = 0
 
-        causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device)
+        causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device, model_dtype)
         input_pos = torch.arange(curr_seq_len, device = device).unsqueeze(0)
+        print("model input: ", input_prompt)
+
         output = model(input_prompt, mask = causal_mask, input_pos = input_pos) # shape: [(1+n), bs, seq, vocab_dim]
 
         base_logits = output[0][:, -1] # shape: [bs, vocab_dim]
@@ -145,11 +154,11 @@ def evaluate(dataloader, model, tokens_to_generate = 10):
             pass_idx += 1
             #now take all of the previous outputs and put them into the model as a batch
             curr_seq_len = preds.shape[1] 
-            causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device)
+            causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device, model_dtype)
             # shape: [bs, curr_seq, self.encoder_max_cache_seq_len], boolean mask with True representing queries to attend
             input_pos = torch.arange(curr_kv_len, curr_kv_len + curr_seq_len, device=device).unsqueeze(0)
             # All True rect mask of new_tokens x tokens_generated | upper_triangular mask of new_tokens x new_tokens + False rect mask of new_tokens x (encoder_max_cache_seq_len - (tokens_generated + new_tokens))
-
+            print("model input: ", preds)
             pred = model(preds, mask = causal_mask, input_pos = input_pos) # shape: [(1+n), bs, (1+n), vocab_dim]
 
             
@@ -161,39 +170,34 @@ def evaluate(dataloader, model, tokens_to_generate = 10):
             # compare base_out with preds to see which medusa_heads in the prev inference were correct:
             mask = (base_out[:, :-1] == preds[:, 1:])
             correct_pred_mask = mask.cumprod(dim = -1)
-            last_accepted_head = correct_pred_mask.sum()
+            last_accepted_head = correct_pred_mask.sum().item()
 
             # accept_len denotes the last head that was correct. If the last head was correct then when it is inputted back into the model, the output will also be relevant (with the base_out also being correct). Therefore the base_out is taken as an accepted token and the medusa_out is taken as the input for the next pass.
-            curr_kv_len += (last_accepted_head)
+            curr_kv_len += (last_accepted_head+1)
+
             # reset kv cache to curr_kv_len
+            model.revert_cache_to_valid_length(curr_kv_len)
             tokens_generated += (last_accepted_head+1)
             
 
             # what should be the input for the next pass? The last medusa pred that was correct. Take it's output as the input for the next pass.
             accepted_head_medusa_pred = medusa_out[:, :, last_accepted_head] # shape: [n, bs]
             accepted_head_medusa_pred = accepted_head_medusa_pred.transpose(0, 1)
+            # breakpoint()
             preds = torch.cat((base_out[:, last_accepted_head: last_accepted_head + 1], accepted_head_medusa_pred), dim = -1)
-            accept_lengths.append((last_accepted_head+1).item())
+            accept_lengths.append((last_accepted_head+1))
             
             # Extract the accepted tokens for decoding
             accepted_tokens = base_out[0, :last_accepted_head+1]  # shape: [last_accepted_head+1]
-            print(f"Prediction {pass_idx}: ", tokenizer.decode(accepted_tokens.flatten().tolist(), skip_special_tokens=False))
+            decoded_prediction = decode(accepted_tokens) 
+            predictions.extend(decoded_prediction)
+            # tokenizer.decode(accepted_tokens.flatten().tolist(), skip_special_tokens=False)
+            print(f"Prediction {pass_idx}: ", decoded_prediction)
+
             # preds is the new input for the next pass
-            # breakpoint()
-
-
-
-
-
-
-            # new_output[0, 0] == output[0, 1]
-            # new_output[1, 0] == output[0, 2]
-            # new_output[2, 0] == output[0, 3] 
-            # Then new_output[3, :] (of shape = 1 x [1 + medusa_heads] x vocab_dim) will be the batched input for the next model (which will be of shape = [1 + medusa_heads] x 1 x vocab_dim)
-            # kv cache has to be cleared at some point. Which point will that be? And what is cached inside the kv cache? Everytime inference occurs, the kv values are cached, including for the new input. The outputs kv values are not cached since they're not yet calculated. Therefore, if there are no all values tally, then the kv values for the entire batch will be cached. But they won't be cached sequentially will they? Correct, so instead of passing the input as a vector, it will have to be a matrix of [1 + medusa_heads] x [1 + medusa_heads] similar to an attention mask. We want to save the kv cache of the most recently successful row and delete all others. How does this work with a batch of inputs though?
-            # At this point the attention_mask will have
-
+            
         print("accept_lengths: ", accept_lengths)
+        print("Prediction: ", ''.join(predictions))
         return
 
 if __name__ == "__main__":
@@ -202,7 +206,7 @@ if __name__ == "__main__":
     dataset_dir = '/home/ubuntu/vanshaj/justpi.jsonl'
     torch.cuda.empty_cache()
     device = torch.device('cuda:1')
-    max_cache_size = 4096
+    max_cache_size = 256
     dataloader = load_data(dataset_dir, tokenizer_dir, bs = 1)
     # checkpoint_dir = None
     model = load_model(checkpoint_dir)

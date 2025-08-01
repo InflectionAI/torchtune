@@ -83,7 +83,7 @@ def llama3_1_medusa(
     num_kv_heads = num_kv_heads if num_kv_heads else num_heads
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor)
     layers = []
-    for _ in range(num_layers):
+    for layer_num in range(num_layers):
         self_attn = MultiHeadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -105,6 +105,9 @@ def llama3_1_medusa(
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
             mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
         )
+         # DEBUG
+        # if layer_num == 0:
+        #     layer.attn.should_print = True
         layers.append(layer)
     layers = nn.ModuleList(layers)
 
