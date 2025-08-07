@@ -163,7 +163,7 @@ class Llama3ScaledRoPE(nn.Module):
         rope_cache = (
             self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
         )
-
+        # print("rope_cache:", rope_cache)
         # reshape input; the last dimension is used for computing the output.
         # Cast to float to match the reference implementation
         # tensor has shape [b, s, n_h, h_d // 2, 2]

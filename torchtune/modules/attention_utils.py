@@ -193,7 +193,7 @@ def _sdpa_or_flex_attention() -> Callable:
     """
 
     if _SUPPORTS_FLEX_ATTENTION:
-
+        
         def _attention_call(
             q: torch.Tensor,
             k: torch.Tensor,
@@ -242,7 +242,6 @@ def _sdpa_or_flex_attention() -> Callable:
                 )
 
     else:
-
         def _attention_call(
             q: torch.Tensor,
             k: torch.Tensor,

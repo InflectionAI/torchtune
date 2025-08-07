@@ -1058,7 +1058,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             outputs = outputs.reshape(-1, outputs.size(-1))
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
-        breakpoint()
         # Compute loss
         loss = self._loss_fn(outputs, labels)
 

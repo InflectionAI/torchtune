@@ -7,3 +7,5 @@
 
 5. Reset kv cache. Also log metrics only for assistant responses?
 6. How does kv caching work for a batch of inputs and if I'm batching the medusa_output, does that append to the kv cache of the actual input? So if B x [1+n] is the output dim, and I batch the inputs, what dimensionality does it have? Is it B[1+n] x 1 ? 
+
+7. Make sure that the decoding is occuring correctly and that the kv cache is being used correctly too

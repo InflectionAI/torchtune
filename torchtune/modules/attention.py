@@ -144,7 +144,7 @@ class MultiHeadAttention(nn.Module):
         # passes. when disabled, we can have the cache setup but still
         # perform normal forward passes
         self.cache_enabled = False
-
+        
     def setup_cache(
         self, batch_size: int, dtype: torch.dtype, max_seq_len: int
     ) -> None:
@@ -254,15 +254,16 @@ class MultiHeadAttention(nn.Module):
         
         # DEBUG
         # Verify consistency of kv caching
-        if self.should_print:
-            print("______________________________________________________")
-            print("Before")
-            print("______________________________________________________")
+        # if self.should_print:
+            
+        #     print("______________________________________________________")
+        #     print("Before")
+        #     print("______________________________________________________")
 
-            print("self.kv_cache.size: ", self.kv_cache.size)
-            print("self.kv_cache.shape: ", self.kv_cache.k_cache.shape)
-            print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
-            print("input_pos: ", input_pos)
+        #     print("self.kv_cache.size: ", self.kv_cache.size)
+        #     print("self.kv_cache.shape: ", self.kv_cache.k_cache.shape)
+        #     print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
+        #     print("input_pos: ", input_pos)
             # print("self.kv_cache.k_cache: ", self.kv_cache.k_cache)
 
         if y is None:
@@ -272,7 +273,9 @@ class MultiHeadAttention(nn.Module):
                 )
             k = self.kv_cache.k_cache
             v = self.kv_cache.v_cache
+            
         else:
+            
             # Update k and v shape, positional embeddings, and normalization
 
             # k,v shape [b, s_y, num_kv_heads * head_dim]
@@ -294,10 +297,23 @@ class MultiHeadAttention(nn.Module):
             if self.k_norm is not None:
                 k = self.k_norm(k)
 
+            if self.should_print and self.kv_cache is not None and self.cache_enabled:
+                print("-------------------------")
+                print("Before updating, kv_cache.size:", self.kv_cache.size)
+                # print("Before updating, k.shape:", k.shape)
+                # breakpoint()
+
             # Update key-value cache
             if self.kv_cache is not None and self.cache_enabled:
                 k, v = self.kv_cache.update(k, v)
 
+            #     if self.should_print:
+            #         # print("-------------------------")
+            #         print("After updating, kv_cache.size:", self.kv_cache.size)                
+            #         print("k:\n", k[:, 0, :self.kv_cache.size, :10])
+            # else:
+            #     if self.should_print:
+            #         print("k:\n", k[:, 0, :, :10])
         # If needed, expand the key and value tensors to have the same shape
         # as the query tensor by copying values across the relevant dim
         # k,v shape: [b, n_kv, s, h_d] -> [b, n_h, s, h_d]
@@ -305,7 +321,10 @@ class MultiHeadAttention(nn.Module):
             expand_shape = (b, self.num_kv_heads, q_per_kv, -1, self.head_dim)
             k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
             v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
-
+        
+        if self.should_print and self.kv_cache is None:
+            print(self.is_causal)
+        
         output = self._attention_call(
             q,
             k,
@@ -320,11 +339,11 @@ class MultiHeadAttention(nn.Module):
 
         # DEBUG
         # Verify consistency of kv caching
-        if self.should_print:
-            print("______________________________________________________")
-            print("After")
-            print("______________________________________________________")
-            print("self.kv_cache.size: ", self.kv_cache.size)
-            print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
+        # if self.should_print:
+        #     print("______________________________________________________")
+        #     print("After")
+        #     print("______________________________________________________")
+        #     print("self.kv_cache.size: ", self.kv_cache.size)
+        #     print("self.kv_cache.cache_pos: ", self.kv_cache.cache_pos)
 
         return self.output_proj(output)

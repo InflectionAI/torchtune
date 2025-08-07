@@ -1,5 +1,3 @@
-# model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
-
 model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
 output_dir: medusa_checkpoints/
 tokenizer:
@@ -10,22 +8,20 @@ dataset:
   source: json
   data_files: /home/ubuntu/vanshaj/justpi.jsonl
   conversation_column: messages
-  train_on_input: True
-  packed: False
+  train_on_input: true
+  packed: false
   conversation_style: openai
-  split: train[:80%]  # Training data
+  split: train[:80%]
 dataset_val:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
   data_files: /home/ubuntu/vanshaj/justpi.jsonl
   conversation_column: messages
-  train_on_input: True
-  packed: False
+  train_on_input: true
+  packed: false
   conversation_style: openai
-  split: train[80%:90%]  # Validation data
-
-collate_fn: "torchtune.data.padded_collate_sft"
-
+  split: train[80%:90%]
+collate_fn: torchtune.data.padded_collate_sft
 seed: 42
 shuffle: true
 model:
@@ -33,48 +29,50 @@ model:
 checkpointer:
   _component_: torchtune.training.FullModelTorchTuneCheckpointer
   checkpoint_dir: ${model_dir}
-  checkpoint_files: ["consolidated_torchtune.00.pth"]
+  checkpoint_files:
+  - consolidated_torchtune.00.pth
   recipe_checkpoint: null
   output_dir: ${output_dir}
   model_type: LLAMA3
-resume_from_checkpoint: false  # Ensure fresh start
-batch_size: 1  # Reduced to avoid memory issues
+resume_from_checkpoint: false
+batch_size: 1
 epochs: 5
 optimizer:
   _component_: torch.optim.AdamW
-  lr: 1.0e-03
+  lr: 0.0001
   fused: true
 loss:
   _component_: torchtune.modules.loss.MedusaCrossEntropyLoss
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
-  num_warmup_steps: 50
+  num_warmup_steps: 20
 max_steps_per_epoch: null
-run_val_every_n_steps: 1000  # Run validation every 100 steps
-batch_size_val: 8  # Validation batch size (can be higher than training)
-save_best_checkpoint: true  # Save best checkpoint based on validation loss
-val_checkpoint_dir: medusa_val_checkpoints/  # Directory for validation checkpoints
-clip_grad_norm: 1.0  # Gradient clipping for stability
+run_val_every_n_steps: 1000
+batch_size_val: 8
+save_best_checkpoint: true
+val_checkpoint_dir: medusa_val_checkpoints/
+clip_grad_norm: 1.0
 gradient_accumulation_steps: 4
 device: cuda
-enable_activation_checkpointing: true  # Disable to reduce complexity
+enable_activation_checkpointing: true
 enable_activation_offloading: false
-custom_sharded_layers: ['tok_embeddings', 'output', 'medusa_heads']  # Include Medusa heads in FSDP sharding
-fsdp_cpu_offload: false #true
-fsdp_reshard_after_forward: false  # Use SHARD_GRAD_OP to reduce communication overhead
-enable_async_checkpointing: true  # Use async checkpointing to avoid blocking
+custom_sharded_layers:
+- tok_embeddings
+- output
+- medusa_heads
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: false
+enable_async_checkpointing: true
 compile: false
 optimizer_in_bwd: false
 dtype: bf16
 metric_logger:
-  # _component_: torchtune.training.metric_logging.StdoutLogger
   _component_: torchtune.training.metric_logging.WandBLogger
   log_dir: ${output_dir}/logs
   project: torchtune
-
-log_every_n_steps: 1  # Log every 100 steps instead of every step
-log_peak_memory_stats: false  # Turn off memory logging
-log_level: INFO  # Only show warnings and errors
+log_every_n_steps: 1
+log_peak_memory_stats: false
+log_level: INFO
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: false
