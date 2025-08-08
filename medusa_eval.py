@@ -82,12 +82,12 @@ def load_model(checkpoint_dir):
         no_kv_model.eval()
     torch.set_grad_enabled(False)
     # Assuming model.output is your final projection layer (nn.Linear)
-    model.output.weight = nn.Parameter(model.output.weight.float())
-    if model.output.bias is not None:
-        model.output.bias = nn.Parameter(model.output.bias.float())
-    no_kv_model.output.weight = nn.Parameter(no_kv_model.output.weight.float())
-    if no_kv_model.output.bias is not None:
-        no_kv_model.output.bias = nn.Parameter(no_kv_model.output.bias.float())
+    # model.output.weight = nn.Parameter(model.output.weight.float())
+    # if model.output.bias is not None:
+    #     model.output.bias = nn.Parameter(model.output.bias.float())
+    # no_kv_model.output.weight = nn.Parameter(no_kv_model.output.weight.float())
+    # if no_kv_model.output.bias is not None:
+    #     no_kv_model.output.bias = nn.Parameter(no_kv_model.output.bias.float())
     # model = model.float()
     # no_kv_model = no_kv_model.float()
     # with torch.no_grad():
@@ -106,6 +106,7 @@ def load_model(checkpoint_dir):
         return model, no_kv_model
     
     return model
+
 def convert_module_to_float32(module):
     for param in module.parameters(recurse=False):
         param.data = param.data.float()
@@ -118,8 +119,6 @@ def convert_module_to_float32(module):
     for child in module.children():
         convert_module_to_float32(child)
     torch.cuda.empty_cache()
-
-
 
 def format_input(input_tokens):
     assistant_token = 78191
@@ -176,9 +175,6 @@ def create_causal_mask2(
     # Expand to batch dimension
     full_mask = full_mask.unsqueeze(0)  # [1, current_seq_len, total_seq_len]
     # full_mask = full_mask.expand(batch_size, current_seq_len, max_cache_size)
-
-
-    
     return full_mask
 
 
@@ -392,25 +388,45 @@ def no_kv_evaluate(dataloader, model, batch, tokens_to_generate = 5, accepted_pr
     print("Accepted token IDs:", accepted_tokens_list)
     return accepted_tokens_list
 
-
-def kv_evaluate(dataloader, model, batch, tokens_to_generate = 5, input_token = None):
+def get_attn_layer(model):
     for m in model.modules():
             if isinstance(m, TransformerSelfAttentionLayer):
                 layer = m
                 break
             else:
                 layer = None
-    model_dtype = next(model.parameters()).dtype
-    if input_token is None:
-        predictions = []
-        accepted_tokens_list = []
+    return layer
 
+def get_model_dtype(model):
+    return next(model.parameters()).dtype
+
+def get_medusa_preds(output):
+    assert(len(output[0].shape) == 3)
+    bs = output[0].shape[0]
+    seq_len = output[0].shape[1]
+    vocab_dim = output[0].shape[-1]
+    n = len(output[1:])
+    medusa_logits = [m[:, -1] for m in output[1:]] # shape: list of [bs, 1, vocab_dim]
+    
+    assert(medusa_logits[0].shape == [bs, 1, vocab_dim])
+    medusa_logits = torch.stack(medusa_logits, dim = 2) # shape: list of [bs, seq_len, n, vocab_dim]
+    assert(medusa_logits.shape[0, 2, 3] == [bs, n, vocab_dim])
+    
+    medusa_preds = medusa_logits.argmax(dim = -1) # shape: list of [bs, seq_len, n]
+    assert(medusa_preds.shape == [bs, n])
+    return medusa_preds, medusa_logits
+    
+def kv_evaluate(dataloader, model, batch, tokens_to_generate = 5, input_token = None):
+    '''Eval using kv caching'''
+    layer = get_attn_layer(model)
+    model_dtype = get_model_dtype(model)
+    predictions = []
+    accepted_tokens_list = []
+    breakpoint()
+    if input_token is None:
         model.reset_caches()
-        
-        
         input_tokens = batch['tokens'].to(device)
         input_prompt = format_input(input_tokens)
-        # input_prompt = batch
         
         print("input_prompt:", input_prompt)
         print('input_prompt:', decode(input_prompt))
@@ -420,59 +436,74 @@ def kv_evaluate(dataloader, model, batch, tokens_to_generate = 5, input_token = 
         curr_kv_len = 0
 
         # Initial forward pass with full prompt
-        # print('curr_kv_len:', curr_kv_len)
+        # Create mask and input_pos for kv caching
         causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device, model_dtype)
         input_pos = torch.arange(curr_seq_len, device=device).unsqueeze(0).expand(bs, -1)
+
+        # Perform model forward pass
         with sdp_math_context():
             output = model(input_prompt, mask=causal_mask, input_pos=input_pos)
+
         base_logits = output[0][:, -1]  # shape: [bs, vocab_dim]
+        vocab_dim = base_logits.shape[-1]
         next_token = base_logits.argmax(dim=-1, keepdim=True)  # shape: [bs, 1]
         
+        n = len(output[1:]) # num medusa heads
+        # get last medusa logits
+        medusa_preds, medusa_logits = get_medusa_preds(output)
+    
         accepted_tokens_list.append(next_token.item())
         decoded_prediction = decode(next_token)
         predictions.append(decoded_prediction)
         
-        
+        combined_preds = torch.cat((next_token, medusa_preds), dim = 1)
+        combined_logits = torch.cat((base_logits, medusa_logits), dim = 1)
+
+        # update kv cache
         curr_kv_len = curr_seq_len
         model_kv_len = layer.attn.kv_cache.size
-        # print("curr_kv_len, model_kv_len:", curr_kv_len, model_kv_len)
         assert (curr_kv_len == int(model_kv_len))
-        # tokens_generated = 1
         curr_seq_len = 1
-        # if tokens_generated == tokens_to_generate:
-        #         return base_logits
-        
+        return combined_logits, combined_preds, None
     else:
+        breakpoint()
         bs = input_token.shape[0]
-        next_token = input_token
-        # while tokens_generated < tokens_to_generate:
-        # Update KV cache length
-        
-        model_kv_len = layer.attn.kv_cache.size
-        # print("curr_kv_len, model_kv_len:", curr_kv_len, model_kv_len)
-        curr_kv_len = int(model_kv_len)
-        assert (curr_kv_len == int(model_kv_len))
-        # print('curr_kv_len:', curr_kv_len)
-        curr_seq_len = 1
+        next_tokens = input_token
+        n = model.medusa_num_heads
+        # Verify kv cache size
+        curr_kv_len = layer.attn.kv_cache.size
+        curr_seq_len = 1 + n # seq contains base_model pred with all medusa preds
         # Create mask and positions for single new token
         causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device, model_dtype)
-        # input_pos = torch.arange(curr_kv_len - 1, curr_kv_len, device=device).unsqueeze(0)
-        input_pos = torch.full((bs, 1), curr_kv_len, device=device)
+        input_pos = torch.arange(curr_kv_len - 1, curr_kv_len + (1+n), device=device).unsqueeze(0)
+        # input_pos = torch.full((bs, 1), curr_kv_len, device=device)
 
+        assert(input_pos.shape == [bs, 1+n])
+        
         # Forward pass with just the new token
         with sdp_math_context():
-            output = model(next_token, mask=causal_mask, input_pos=input_pos)
+            output = model(next_token, mask=causal_mask, input_pos=input_pos) # shape: list [bs, 1+n, vocab_dim]
+        assert(output[0].shape == [bs, 1+n, vocab_dim])
         
-        base_logits = output[0][:, -1]  # shape: [bs, vocab_dim]
-        # tokens_generated += 1
-        # if tokens_generated == tokens_to_generate:
-        #     return base_logits
-        next_token = base_logits.argmax(dim=-1, keepdim=True)  # shape: [bs, 1]
+        base_logits = output[0][:, -1]  # shape: [bs, seq_len, vocab_dim] where seq_len = 1+n
+        base_tokens = base_logits.argmax(dim=-1, keepdim=True)  # shape: [bs, 1+n]
+        medusa_preds, medusa_logits = get_medusa_preds(output) # shape:  # shape: list of [bs, seq_len, n] where seq_len = 1+n
+        # Verify preds
+        mask = (base_logits[:, :-1] == base_tokens[:, 1:])
+        mask = mask.cumprod(dim = 1)
+        accepted_head_idx = torch.nonzero(mask)[-1]
+        # if accepted_head_idx = 0 then no head is accepted. So take the last_accepted_base, the head_predictions corresponding to that base for the next iteration.
+        base_token = base_tokens[:, 1+accepted_head_idx].unsqueeze[-1] # shape: [bs, 1]
+        medusa_tokens = medusa_preds[:, 1+accepted_head_idx] # shape: [bs, n]
+        next_tokens = torch.cat((base_token, medusa_tokens), dim = -1)
+        next_logits = torch.cat((base_logits[:, 1+accepted_head_idx], medusa_logits[:, 1+accepted_head_idx]))
+        
         curr_kv_len += 1
+        
         # accepted_tokens_list.append(next_token.item())
-        # decoded_prediction = decode(next_token)
+        decoded_prediction = decode(next_tokens)
         # predictions.append(decoded_prediction)
-    return base_logits, next_token
+        return next_logits, next_tokens, accepted_head_idx
         
     print("-----------------------------------------------------")
     print("Prediction: ", ''.join(predictions))
@@ -529,6 +560,7 @@ def run():
     # kv_model = model
     model_dtype = next(kv_model.parameters()).dtype
     i = 0
+    prediction_consistencies = []
     for batch in dataloader:
     #     batch = torch.tensor([[128000, 128006,   9125, 128007,    271,    791,   3823,    374,   2663,
     #   21077,    323,    279,    892,    374,   7418,     11,   6250,    220,
@@ -543,13 +575,13 @@ def run():
         while(tokens_generated<tokens_to_generate):
             # print("-------no_kv_evaluate--------:")
             # pred_no_kv = no_kv_evaluate(dataloader, no_kv_model, batch, tokens_to_generate)
-            base_logits_no_kv, next_token_no_kv, accepted_preds = no_kv_evaluate(dataloader, no_kv_model, batch, tokens_to_generate, accepted_preds)
+            # base_logits_no_kv, next_token_no_kv, accepted_preds = no_kv_evaluate(dataloader, no_kv_model, batch, tokens_to_generate, accepted_preds)
             # print("------kv_evaluate--------:")
             
             # pred_kv = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate)
-            base_logits_kv, next_token_kv = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate, next_token_kv)
+            next_logits, next_tokens_kv, accepted_head_idx = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate, next_token_kv)
             tokens_generated += 1
-            
+            continue
             if next_token_no_kv != next_token_kv:
                 p_log = F.log_softmax(base_logits_no_kv, dim=-1)
                 q_log = F.log_softmax(base_logits_kv, dim=-1)
@@ -560,10 +592,13 @@ def run():
                 print("next_token_kv, next_token_no_kv", next_token_kv.item(), next_token_no_kv.item())
                 print("kindices, nokindices:", kindices, nokindices)
                 print("kval, nokval:", kval, nokval)
-                if kval[0, 0] != kval[0, 1] and nokval[0, 0] != nokval[0, 1]:
-                    breakpoint()
-                else:
-                    break
+                prediction_consistencies.append(tokens_generated)
+                # if kval[0, 0] != kval[0, 1] and nokval[0, 0] != nokval[0, 1]:
+                #     # breakpoint()
+                #     prediction_consistencies.append(tokens_generated)
+                break
+                # else:
+                #     break
             # else:
             #     print("Same!")
             
@@ -580,7 +615,9 @@ def run():
         accepted_preds = None
         next_token_kv = None
         i+=1
-        if i>=10:
+        if i>=20:
+            print('------------------------------')
+            print("prediction_consistencies: ", prediction_consistencies)
             break
     print(diff_list)
 
@@ -588,7 +625,7 @@ if __name__ == "__main__":
     # Set environment variable for deterministic CuBLAS operations
     import os
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    
+    torch.set_printoptions(precision=9)  
     debug = True
     tokenizer_dir = '/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/tokenizer.model'
     checkpoint_dir = '/home/ubuntu/vanshaj/inf2-training/3rdparty/torchtune/medusa_checkpoints/epoch_0/'
@@ -615,4 +652,3 @@ if __name__ == "__main__":
     
     # evaluate(dataloader, model)
     run()
-    
