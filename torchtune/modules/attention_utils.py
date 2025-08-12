@@ -208,6 +208,9 @@ def _sdpa_or_flex_attention() -> Callable:
             # we assume the user wants to use flex attention instead of traditional SDPA.
             # This will use flash attention under the hood with support for custom masks.
             # Currently, it is used when sample packing is enabled (see torchtune.datasets.PackedDataset)
+            # DEBUG
+            if not is_causal and mask is None:
+                raise ValueError("mask is None, but is_causal is ", is_causal)
             if isinstance(mask, BlockMask):
                 if not torch.compiler.is_compiling():
                     log_once(

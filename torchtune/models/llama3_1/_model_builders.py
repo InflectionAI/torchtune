@@ -37,7 +37,7 @@ def llama3_1_8b() -> TransformerDecoder:
         rope_base=500_000,
     )
 
-def llama3_1_8b_medusa() -> MedusaTransformerDecoder:
+def llama3_1_8b_medusa(medusa_num_heads = 5) -> MedusaTransformerDecoder:
     """
     Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
 
@@ -55,7 +55,7 @@ def llama3_1_8b_medusa() -> MedusaTransformerDecoder:
         attn_dropout=0.0,
         norm_eps=1e-5,
         rope_base=500_000,
-        medusa_num_heads=3
+        medusa_num_heads=medusa_num_heads
     )
 
 def llama3_1_70b() -> TransformerDecoder:

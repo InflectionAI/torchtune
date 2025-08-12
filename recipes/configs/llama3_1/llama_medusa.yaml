@@ -1,14 +1,15 @@
 # model_dir: /mnt/vast/share/inf2-training/experiments/3.1.2_dpo/job_id_12932/checkpoints/epoch_1
 
 model_dir: /home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct
-output_dir: medusa_checkpoints/
+output_dir: medusa_sharegpt_checkpoints/
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
   path: ${model_dir}/tokenizer.model
 dataset:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
-  data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  # data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  data_files: sharegpt_60k_full.jsonl
   conversation_column: messages
   train_on_input: True
   packed: False
@@ -17,7 +18,8 @@ dataset:
 dataset_val:
 - _component_: torchtune.datasets.medusa_chat_dataset
   source: json
-  data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  # data_files: /home/ubuntu/vanshaj/justpi.jsonl
+  data_files: sharegpt_60k_full.jsonl
   conversation_column: messages
   train_on_input: True
   packed: False
@@ -38,7 +40,7 @@ checkpointer:
   output_dir: ${output_dir}
   model_type: LLAMA3
 resume_from_checkpoint: false  # Ensure fresh start
-batch_size: 1  # Reduced to avoid memory issues
+batch_size: 64  # Reduced to avoid memory issues
 epochs: 5
 optimizer:
   _component_: torch.optim.AdamW
@@ -50,10 +52,10 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 50
 max_steps_per_epoch: null
-run_val_every_n_steps: 1000  # Run validation every 100 steps
-batch_size_val: 8  # Validation batch size (can be higher than training)
+run_val_every_n_steps: 23  # Run validation every 100 steps
+batch_size_val: 64  # Validation batch size (can be higher than training)
 save_best_checkpoint: true  # Save best checkpoint based on validation loss
-val_checkpoint_dir: medusa_val_checkpoints/  # Directory for validation checkpoints
+val_checkpoint_dir: medusa_sharegpt_val_checkpoints/  # Directory for validation checkpoints
 clip_grad_norm: 1.0  # Gradient clipping for stability
 gradient_accumulation_steps: 4
 device: cuda

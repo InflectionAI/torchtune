@@ -62,9 +62,10 @@ def load_model(checkpoint_dir):
     if checkpoint_dir == None:
         return
     with init_empty_weights():
-        model = llama3_1_8b_medusa()
+        # Create model with 5 Medusa heads to match the checkpoint
+        model = llama3_1_8b_medusa(medusa_num_heads=5)
         if debug == True: 
-            no_kv_model = llama3_1_8b_medusa()
+            no_kv_model = llama3_1_8b_medusa(medusa_num_heads=5)
     checkpoint_dir += 'model-00001-of-00001.bin'
     checkpoint = torch.load(checkpoint_dir, map_location = device)
 
@@ -411,10 +412,12 @@ def get_medusa_preds(output, first_decode = False):
         medusa_logits = [m[:, -1:] for m in output[1:]] # shape: list of [bs, 1, vocab_dim]
         medusa_logits = torch.cat(medusa_logits, dim = -2)
     else:
-        medusa_logits = output[1:]
-        medusa_logits = torch.stack(medusa_logits, dim = -2) # shape: list of [bs, seq_len, n, vocab_dim]
+        # Fix: properly stack medusa logits from all heads
+        medusa_logits = torch.stack(output[1:], dim=0) # shape: [n, bs, seq_len, vocab_dim]
+        # Transpose to get [bs, seq_len, n, vocab_dim] for easier processing
+        medusa_logits = medusa_logits.transpose(0, 1).transpose(1, 2) # shape: [bs, seq_len, n, vocab_dim]
     
-    medusa_preds = medusa_logits.argmax(dim = -1) # shape: list of [bs, seq_len, n]
+    medusa_preds = medusa_logits.argmax(dim = -1) # shape: [bs, seq_len, n] or [bs, 1, n] for first_decode
     return medusa_preds, medusa_logits
     
 def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5, input_token = None):
@@ -444,7 +447,7 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         with sdp_math_context():
             output = model(input_prompt, mask=causal_mask, input_pos=input_pos)
 
-        base_logits = output[0][:, -1:]  # shape: [bs, vocab_dim]
+        base_logits = output[0][:, -1:]  # shape: [bs, 1, vocab_dim]
         vocab_dim = base_logits.shape[-1]
         next_token = base_logits.argmax(dim=-1)  # shape: [bs, 1]
         
@@ -470,71 +473,69 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
     else:
         # breakpoint()
         bs = input_token.shape[0]
-        next_token = input_token
+        prev_preds = input_token  # This contains [base_token, medusa_tokens] from previous iteration
         n = model.medusa_num_heads
         # Verify kv cache size
         curr_kv_len = layer.attn.kv_cache.size
         curr_seq_len = 1 + n # seq contains base_model pred with all medusa preds
-        # Create mask and positions for single new token
+        
+        # Create mask and positions for the new tokens
         causal_mask = create_causal_mask(bs, curr_seq_len, curr_kv_len, max_cache_size, device, model_dtype)
-        # breakpoint()
-        input_pos = torch.arange(curr_kv_len, curr_kv_len + (1+n), device=device).unsqueeze(0)
-        # input_pos = torch.full((bs, 1), curr_kv_len, device=device)
-
+        input_pos = torch.arange(curr_kv_len, curr_kv_len + curr_seq_len, device=device).unsqueeze(0)
+        
         assert(input_pos.shape == (bs, 1+n))
         
-        # Forward pass with just the new token
+        # Forward pass with the new tokens
         with sdp_math_context():
-            output = model(next_token, mask=causal_mask, input_pos=input_pos) # shape: list [bs, 1+n, vocab_dim]
-        # assert(output[0].shape == (bs, 1+n, vocab_dim))
+            output = model(prev_preds, mask=causal_mask, input_pos=input_pos) # shape: list [bs, 1+n, vocab_dim]
         
-        base_logits = output[0]#[:, -1:]  # shape: [bs, seq_len, vocab_dim] where seq_len = 1+n
+        base_logits = output[0]  # shape: [bs, 1+n, vocab_dim] where seq_len = 1+n
         base_tokens = base_logits.argmax(dim=-1)  # shape: [bs, 1+n]
-        medusa_preds, medusa_logits = get_medusa_preds(output) # shape:  # shape: list of [bs, seq_len, n] where seq_len = 1+n
-        # Verify preds
+        medusa_preds, medusa_logits = get_medusa_preds(output) # shape: [bs, 1+n, n]
         
-        mask = (next_token[:, 1:] == base_tokens[:, :-1])
-        mask = mask.cumprod(dim = 1)
-        nz = mask.nonzero(as_tuple=True)[1]
-        # breakpoint()
+        # CORRECTED: Compare base model predictions with previous medusa predictions
+        # The base model should predict the same tokens that were previously predicted by medusa heads
+        # prev_preds[:, 1:] contains the previous medusa predictions
+        # base_tokens[:, :-1] contains what the base model predicts for those positions
+        mask = (prev_preds[:, 1:] == base_tokens[:, :-1])
+        correct_pred_mask = mask.cumprod(dim=1)
+        last_accepted_head = correct_pred_mask.sum().item()
         
-
-        accepted_head_idx = (1 + nz[-1].item()) if nz.numel()>0 else 0
-        accepted_head_idx = min(accepted_head_idx, n)
-        # accepted_head_idx += 1
-        # if accepted_head_idx = 0 then no head is accepted. So take the last_accepted_base, the head_predictions corresponding to that base for the next iteration.
-        print("accepted_head_idx:", accepted_head_idx)
-        if accepted_head_idx>0:
-            print("next_token:", next_token, decode(next_token))
-            print("base_tokens:", base_tokens, decode(base_tokens))
-
-        # breakpoint()
-        base_token = base_tokens[:, accepted_head_idx].unsqueeze(-1) # shape: [bs, 1]
-        medusa_tokens = medusa_preds[:, accepted_head_idx] # shape: [bs, n]
+        print("prev_preds:", prev_preds, decode(prev_preds))
+        print("base_tokens:", base_tokens, decode(base_tokens))
+        print("mask:", mask)
+        print("correct_pred_mask:", correct_pred_mask)
+        print("last_accepted_head:", last_accepted_head)
         
-
-        # breakpoint()
-        next_tokens = torch.cat((base_token, medusa_tokens), dim = -1)
-        # assert(next_tokens.shape[1] == (1 + n))
-        next_logits = torch.cat((base_logits[:, accepted_head_idx].unsqueeze(1), medusa_logits[:, accepted_head_idx]), dim = -2)
+        # The number of tokens to accept is last_accepted_head + 1
+        # (the base token + the accepted medusa tokens)
+        accepted_tokens_count = last_accepted_head + 1
         
-        curr_kv_len += 1
-        # reset cache
+        # Update KV cache length
+        curr_kv_len += accepted_tokens_count
+        
+        # Reset cache to valid length (remove invalid medusa predictions)
         print("-----------------------------------------------------")
         print('cache len before:', layer.attn.kv_cache.size)
-        curr_len = layer.attn.kv_cache.size
-        invalid_len = n - accepted_head_idx
-        valid_len = curr_len - invalid_len
-        model.revert_cache_to_valid_length(valid_len)
+        model.revert_cache_to_valid_length(curr_kv_len)
         print('cache len after:', layer.attn.kv_cache.size)
-
-        # accepted_tokens_list.append(next_token.item())
-        print("-----------------------------------------------------")
+        
+        # Prepare next input: base token + medusa predictions for next iteration
+        base_token = base_tokens[:, last_accepted_head].unsqueeze(-1)  # shape: [bs, 1]
+        medusa_tokens = medusa_preds[:, last_accepted_head]  # shape: [bs, n]
+        
+        next_tokens = torch.cat((base_token, medusa_tokens), dim=-1)  # shape: [bs, 1+n]
+        next_logits = torch.cat((
+            base_logits[:, last_accepted_head].unsqueeze(1), 
+            medusa_logits[:, last_accepted_head]
+        ), dim=-2)
+        
+        # Decode and store the accepted base token
         decoded_prediction = decode(base_token)
         kv_predictions.append(decoded_prediction)
-        # print(decoded_prediction)
-        # predictions.append(decoded_prediction)
-        return next_logits, next_tokens, accepted_head_idx
+        
+        print("-----------------------------------------------------")
+        return next_logits, next_tokens, last_accepted_head
         
     print("-----------------------------------------------------")
     print("Prediction: ", ''.join(predictions))
@@ -613,7 +614,13 @@ def run():
             # pred_kv = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate)
             # breakpoint()
             next_logits, next_token_kv, accepted_head_idx = kv_evaluate(dataloader, kv_model, batch, kv_predictions, tokens_to_generate, next_token_kv)
-            tokens_generated += 1
+            
+            # Fix: increment by the number of accepted tokens (base + accepted medusa heads)
+            if accepted_head_idx is not None:
+                tokens_generated += (accepted_head_idx + 1)
+            else:
+                tokens_generated += 1
+                
             continue
         
             if next_token_no_kv != next_token_kv:
@@ -668,8 +675,10 @@ if __name__ == "__main__":
     torch.set_printoptions(precision=9)  
     debug = True
     tokenizer_dir = '/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/tokenizer.model'
-    checkpoint_dir = '/home/ubuntu/vanshaj/inf2-training/3rdparty/torchtune/medusa_checkpoints/epoch_0/'
+    # checkpoint_dir = '/home/ubuntu/vanshaj/inf2-training/3rdparty/torchtune/medusa_checkpoints/epoch_0/'
+    checkpoint_dir = '/home/ubuntu/vanshaj/torchtune/medusa_sharegpt_val_checkpoints/epoch_2000046/'
     dataset_dir = '/home/ubuntu/vanshaj/justpi.jsonl'
+    dataset_dir = 'sharegpt_60k_full.jsonl'
     torch.cuda.empty_cache()
     device = torch.device('cuda:1')
     max_cache_size = 500

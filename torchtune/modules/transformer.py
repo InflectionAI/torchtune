@@ -396,6 +396,7 @@ class TransformerDecoder(nn.Module):
         self.tok_embeddings = tok_embeddings
         self.layers = layers
         self.norm = norm
+        
         self.output = output
         self.output_hidden_states = output_hidden_states or []
         self.max_seq_len = max_seq_len
@@ -689,6 +690,7 @@ class TransformerDecoder(nn.Module):
     def unembed(self, h):
         # shape: [b, s, d]
         h = self.norm(h)
+        # h = h.float()
         if self.skip_output_layer:
             output = h
         elif self.num_output_chunks > 0:
