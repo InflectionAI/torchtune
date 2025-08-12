@@ -19,6 +19,8 @@ import numpy as np
 import random
 import torch.nn as nn
 from contextlib import nullcontext
+from datetime import datetime
+import uuid
 # Set up logging globally here
 logging.basicConfig(
     level=logging.DEBUG,  # or INFO in production
@@ -36,6 +38,26 @@ def sdp_math_context():
         return nullcontext()
 
 global tokenizer
+
+def check_stop_tokens(token_id, stop_tokens=None):
+    """Check if a token is a stop token
+    
+    This function is used by individual generation functions to detect stop tokens
+    and immediately halt their generation process. When a stop token is detected,
+    the function returns True, signaling that generation should stop.
+    """
+    if stop_tokens is None:
+        # Common stop tokens for Llama models
+        stop_tokens = [
+            128009,  # eot_id token
+            128006,  # start_header_id token
+            128007,  # end_header_id token
+            2,       # </s> token
+            1,       # <s> token
+            78191,   # assistant token (common in chat models)
+        ]
+    return token_id in stop_tokens
+
 def load_data(dataset_dir, tokenizer_dir, bs = 1):
     global tokenizer
     tokenizer = Llama3Tokenizer(tokenizer_dir)
@@ -46,7 +68,7 @@ def load_data(dataset_dir, tokenizer_dir, bs = 1):
         data_files=dataset_dir,
         conversation_column="messages",
         conversation_style="openai",
-        split = 'train[80%:90%]'
+        split = 'train[90%:]'
     )
 
     # Create dataloader
@@ -178,6 +200,26 @@ def create_causal_mask2(
     # full_mask = full_mask.expand(batch_size, current_seq_len, max_cache_size)
     return full_mask
 
+# def kl_div():
+#     if next_token_no_kv != next_token_kv:
+#         p_log = F.log_softmax(base_logits_no_kv, dim=-1)
+#         q_log = F.log_softmax(base_logits_kv, dim=-1)
+#         kl = torch.sum(torch.exp(p_log) * (p_log - q_log))  # KL(p || q)
+#         # print("pred_kv, pred_no_kv, kl norm:", kl)
+#         kval, kindices = torch.topk(base_logits_kv, k = 4)
+#         nokval, nokindices = torch.topk(base_logits_no_kv, k = 4)
+#         print("next_token_kv, next_token_no_kv", next_token_kv.item(), next_token_no_kv.item())
+#         print("kindices, nokindices:", kindices, nokindices)
+#         print("kval, nokval:", kval, nokval)
+#         prediction_consistencies.append(tokens_generated)
+        # if kval[0, 0] != kval[0, 1] and nokval[0, 0] != nokval[0, 1]:
+        #     
+        #     prediction_consistencies.append(tokens_generated)
+        # break
+        # else:
+        #     break
+    # else:
+    #     print("Same!")
 
 def evaluate(dataloader, model, tokens_to_generate = 100):
     predictions = []
@@ -320,11 +362,12 @@ def create_causal_mask(
     # return default_mask.unsqueeze(0)
     return mask
 
-def no_kv_evaluate(dataloader, model, batch, no_kv_predictions, tokens_to_generate = 5, accepted_preds = None):
+def no_kv_evaluate(dataloader, model, batch, no_kv_predictions, no_kv_tokens, tokens_to_generate = 5, accepted_preds = None):
     # predictions = []
     # global no_kv_predictions
     accepted_tokens_list = []
-    # breakpoint()
+    
+    
     if accepted_preds is None:
 
         input_tokens = batch['tokens'].to(device)
@@ -357,6 +400,7 @@ def no_kv_evaluate(dataloader, model, batch, no_kv_predictions, tokens_to_genera
         # Appending next token to list of predicted tokens
         decoded = decode(next_token)
         no_kv_predictions.append(decoded)
+        no_kv_tokens.append(next_token)
     else:
         # while tokens_generated < tokens_to_generate:
         # torch.cuda.empty_cache() 
@@ -387,7 +431,19 @@ def no_kv_evaluate(dataloader, model, batch, no_kv_predictions, tokens_to_genera
         # Decode and store
         decoded = decode(next_token)
         no_kv_predictions.append(decoded)
-    return base_logits, next_token, accepted_preds
+        no_kv_tokens.append(next_token)
+        
+        # Check for stop tokens and stop generating immediately
+        if check_stop_tokens(next_token.item()):
+            print(f"🚫 Stop token {next_token.item()} detected in no_kv_evaluate, stopping generation")
+            print(f"Decoded stop token: {decode(torch.tensor([[next_token.item()]], device=device))}")
+            return base_logits, next_token, accepted_preds, True  # True indicates stop token found
+            
+        # Continue generating more tokens if no stop token
+        # This would be where you'd add a loop to generate more tokens
+        # For now, we just return after the first token
+        
+    return base_logits, next_token, accepted_preds, False  # False indicates no stop token
     print("-----------------------------------------------------")
     print("Prediction: ", ''.join(predictions))
     print("Accepted token IDs:", accepted_tokens_list)
@@ -423,12 +479,13 @@ def get_medusa_preds(output, first_decode = False):
     medusa_preds = medusa_logits.argmax(dim = -1) # shape: [bs, seq_len, n] or [bs, 1, n] for first_decode
     return medusa_preds, medusa_logits
     
-def kv_evaluate(dataloader, model, batch, kv_predictions, accepted_heads, accelerated_predictions, tokens_to_generate = 5, input_token = None):
+def kv_evaluate(dataloader, model, batch, kv_predictions, kv_tokens, accepted_heads, accelerated_predictions, tokens_to_generate = 5, input_token = None):
     '''Eval using kv caching'''
     layer = get_attn_layer(model)
     model_dtype = get_model_dtype(model)
     accepted_tokens_list = []
-    # breakpoint()
+    
+    
     if input_token is None:
         model.reset_caches()
         input_tokens = batch['tokens'].to(device)
@@ -461,7 +518,14 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, accepted_heads, accele
         # accepted_tokens_list.append(next_token.item())
         decoded_prediction = decode(next_token)
         kv_predictions.append(decoded_prediction)
+        kv_tokens.append(next_token)
+        # Check for stop tokens in the first generated token
+        if check_stop_tokens(next_token.item()):
+            print(f"🚫 Stop token {next_token.item()} detected in kv_evaluate (first token), stopping generation")
+            print(f"Decoded stop token: {decode(torch.tensor([[next_token.item()]], device=device))}")
+            return combined_logits, combined_preds, None, True  # True indicates stop token found
         
+        # Continue with normal processing if no stop token
         combined_preds = torch.cat((next_token, medusa_preds), dim = 1) # shape: [bs, 1+n]
         combined_logits = torch.cat((base_logits, medusa_logits), dim = 1) # shape: [bs, 1+n, vocab_dim]
 
@@ -472,9 +536,9 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, accepted_heads, accele
         # curr_seq_len = 1
         print("-----------------------------------------------------")
         print('cache len now:', layer.attn.kv_cache.size)
-        return combined_logits, combined_preds, None
+        return combined_logits, combined_preds, None, False  # False indicates no stop token
     else:
-        # breakpoint()
+        
         bs = input_token.shape[0]
         prev_preds = input_token  # This contains [base_token, medusa_tokens] from previous iteration
         n = model.medusa_num_heads
@@ -548,9 +612,16 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, accepted_heads, accele
         # Decode and store the accepted base token
         decoded_prediction = decode(accepted_preds)
         kv_predictions.append(decoded_prediction)
+        kv_tokens.append(accepted_preds)
+        # Check for stop tokens in the accepted base token
+        if check_stop_tokens(base_tokens[:, last_accepted_head].item()):
+            print(f"🚫 Stop token {base_tokens[:, last_accepted_head].item()} detected in kv_evaluate, stopping generation")
+            print(f"Decoded stop token: {decode(torch.tensor([[base_tokens[:, last_accepted_head].item()]], device=device))}")
+            return next_logits, next_tokens, last_accepted_head, True  # True indicates stop token found
         
+        # Continue with normal processing if no stop token
         print("-----------------------------------------------------")
-        return next_logits, next_tokens, last_accepted_head
+        return next_logits, next_tokens, last_accepted_head, False  # False indicates no stop token
         
     print("-----------------------------------------------------")
     print("Prediction: ", ''.join(predictions))
@@ -615,15 +686,150 @@ def no_kv_evaluate2(dataloader, model, batch, tokens_to_generate=10):
     print("Accepted token IDs:", accepted_preds_list)
     return ''.join(predictions)
 
+def log_evaluation_results(prompt_num, prompt_text, kv_predictions_str, no_kv_predictions_str, 
+                          kv_tokens, no_kv_tokens, avg_acceleration, value_avg_acceleration, 
+                          accelerated_predictions, diff_list, accepted_heads, kv_index, no_kv_index,
+                          avg_head_acceptance, tokens_generated, kv_stop, no_kv_stop, 
+                          kv_stop_token, no_kv_stop_token, log_file="medusa_eval_results.jsonl"):
+    """
+    Log evaluation results for each prompt to a JSONL file for later analysis.
+    JSONL format allows appending results line by line without loading entire file.
+    """
+    
+    # Helper function to convert tensors to serializable types
+    def tensor_to_serializable(obj):
+        if isinstance(obj, torch.Tensor):
+            if obj.numel() == 1:
+                return obj.item()
+            else:
+                return obj.tolist()
+        elif isinstance(obj, list):
+            return [tensor_to_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: tensor_to_serializable(value) for key, value in obj.items()}
+        else:
+            return obj
+    
+    # Create log entry
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "prompt_id": str(uuid.uuid4()),
+        "prompt_number": prompt_num,
+        "prompt_text": prompt_text,
+        "results": {
+            "kv_predictions": kv_predictions_str,
+            "no_kv_predictions": no_kv_predictions_str,
+            "kv_tokens": tensor_to_serializable(kv_tokens),
+            "no_kv_tokens": tensor_to_serializable(no_kv_tokens),
+            "tokens_generated": tokens_generated,
+            "divergence": {
+                "kv_index": kv_index,
+                "no_kv_index": no_kv_index,
+                "difference_starts_at": no_kv_index,
+                "total_no_kv_tokens": len(no_kv_tokens) if no_kv_tokens else 0
+            },
+            "head_acceptance": {
+                "accepted_heads": tensor_to_serializable(accepted_heads),
+                "accepted_heads_till_divergence": tensor_to_serializable(accepted_heads[:kv_index-1] if kv_index and kv_index > 1 else []),
+                "avg_head_acceptance": avg_head_acceptance
+            },
+            "acceleration_metrics": {
+                "current_acceleration": 1 + avg_head_acceptance if avg_head_acceptance is not None else 0,
+                "cumulative_avg_acceleration": value_avg_acceleration,
+                "all_accelerations": tensor_to_serializable(avg_acceleration),
+                "accelerated_predictions": tensor_to_serializable(accelerated_predictions)
+            },
+            "stop_token_analysis": {
+                "kv_stopped": kv_stop,
+                "no_kv_stopped": no_kv_stop,
+                "kv_stop_token_id": kv_stop_token,
+                "no_kv_stop_token_id": no_kv_stop_token,
+                "kv_stop_token_decoded": decode(torch.tensor([[kv_stop_token]], device=device)) if kv_stop_token is not None and 'decode' in globals() else None,
+                "no_kv_stop_token_decoded": decode(torch.tensor([[no_kv_stop_token]], device=device)) if no_kv_stop_token is not None and 'decode' in globals() else None
+            }
+        },
+        "metadata": {
+            "model_checkpoint": checkpoint_dir if 'checkpoint_dir' in globals() else "unknown",
+            "dataset": dataset_dir if 'dataset_dir' in globals() else "unknown",
+            "tokens_to_generate": tokens_to_generate if 'tokens_to_generate' in globals() else "unknown"
+        }
+    }
+    
+    # Append to JSONL file (one JSON object per line)
+    with open(log_file, 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+    
+    print(f"📝 Results logged to {log_file} for prompt {prompt_num}")
+    return log_entry
+
+def analyze_jsonl_results(log_file="medusa_eval_results.jsonl"):
+    """
+    Utility function to analyze the logged JSONL results.
+    Returns a summary of all evaluations.
+    """
+    results = []
+    try:
+        with open(log_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    results.append(json.loads(line))
+    except FileNotFoundError:
+        print(f"Log file {log_file} not found.")
+        return None
+    
+    if not results:
+        print("No results found in log file.")
+        return None
+    
+    # Calculate summary statistics
+    total_prompts = len(results)
+    avg_accelerations = [r['results']['acceleration_metrics']['current_acceleration'] for r in results]
+    avg_acceleration = sum(avg_accelerations) / len(avg_accelerations) if avg_accelerations else 0
+    
+    # Find divergence points
+    divergence_points = [r['results']['divergence']['difference_starts_at'] for r in results if r['results']['divergence']['difference_starts_at'] is not None]
+    avg_divergence = sum(divergence_points) / len(divergence_points) if divergence_points else 0
+    
+    # Stop token statistics
+    kv_stops = sum(1 for r in results if r['results']['stop_token_analysis']['kv_stopped'])
+    no_kv_stops = sum(1 for r in results if r['results']['stop_token_analysis']['no_kv_stopped'])
+    
+    # Most common stop tokens
+    kv_stop_tokens = [r['results']['stop_token_analysis']['kv_stop_token_id'] for r in results if r['results']['stop_token_analysis']['kv_stop_token_id'] is not None]
+    no_kv_stop_tokens = [r['results']['stop_token_analysis']['no_kv_stop_token_id'] for r in results if r['results']['stop_token_analysis']['no_kv_stop_token_id'] is not None]
+    
+    summary = {
+        "total_prompts": total_prompts,
+        "average_acceleration": avg_acceleration,
+        "average_divergence_point": avg_divergence,
+        "total_tokens_generated": sum(r['results']['tokens_generated'] for r in results),
+        "stop_token_stats": {
+            "kv_stops": kv_stops,
+            "no_kv_stops": no_kv_stops,
+            "kv_stop_tokens": kv_stop_tokens,
+            "no_kv_stop_tokens": no_kv_stop_tokens
+        },
+        "results": results
+    }
+    
+    print(f"📊 Analysis Summary:")
+    print(f"   Total prompts evaluated: {total_prompts}")
+    print(f"   Average acceleration: {avg_acceleration:.3f}")
+    print(f"   Average divergence point: {avg_divergence:.1f} tokens")
+    print(f"   Total tokens generated: {summary['total_tokens_generated']}")
+    print(f"   KV model stopped: {kv_stops}/{total_prompts} prompts")
+    print(f"   No-KV model stopped: {no_kv_stops}/{total_prompts} prompts")
+    
+    return summary
+
 def run():
     kv_model, no_kv_model = model
     diff_list = []
     # kv_model = model
     model_dtype = next(kv_model.parameters()).dtype
-    i = 0
+    prompt_num = 0
     prediction_consistencies = []
-    avg_acceleration = []
-    outputs = []
+    avg_acceleration = []; outputs = []; accepted_heads = []; accelerated_predictions = []
     for batch in dataloader:
     #     batch = torch.tensor([[128000, 128006,   9125, 128007,    271,    791,   3823,    374,   2663,
     #   21077,    323,    279,    892,    374,   7418,     11,   6250,    220,
@@ -635,43 +841,36 @@ def run():
         tokens_generated = 0
         accepted_preds = None
         next_token_kv = None
-        no_kv_predictions = []; kv_predictions = []; accepted_heads = []; accelerated_predictions = []
-        while(tokens_generated<tokens_to_generate):
-            # print("-------no_kv_evaluate--------:")
-            # pred_no_kv = no_kv_evaluate(dataloader, no_kv_model, batch, tokens_to_generate)
-            base_logits_no_kv, next_token_no_kv, accepted_preds = no_kv_evaluate(dataloader, no_kv_model, batch, no_kv_predictions, tokens_to_generate, accepted_preds)
-            # print("------kv_evaluate--------:")
-            
-            # pred_kv = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate)
-            next_logits, next_token_kv, accepted_head_idx = kv_evaluate(dataloader, kv_model, batch, kv_predictions, accepted_heads, accelerated_predictions, tokens_to_generate, next_token_kv)
-            
-            # Fix: increment by the number of accepted tokens (base + accepted medusa heads)
-            # if accepted_head_idx is not None:
-            #     tokens_generated += (accepted_head_idx + 1)
-            # else:
-            #     tokens_generated += 1
-            tokens_generated +=1
-            continue
+        no_kv_predictions = []; kv_predictions = []; no_kv_tokens = []; kv_tokens = []
+        no_kv_stop = kv_stop = False
+        prompt_num += 1
         
-            if next_token_no_kv != next_token_kv:
-                p_log = F.log_softmax(base_logits_no_kv, dim=-1)
-                q_log = F.log_softmax(base_logits_kv, dim=-1)
-                kl = torch.sum(torch.exp(p_log) * (p_log - q_log))  # KL(p || q)
-                # print("pred_kv, pred_no_kv, kl norm:", kl)
-                kval, kindices = torch.topk(base_logits_kv, k = 4)
-                nokval, nokindices = torch.topk(base_logits_no_kv, k = 4)
-                print("next_token_kv, next_token_no_kv", next_token_kv.item(), next_token_no_kv.item())
-                print("kindices, nokindices:", kindices, nokindices)
-                print("kval, nokval:", kval, nokval)
-                prediction_consistencies.append(tokens_generated)
-                # if kval[0, 0] != kval[0, 1] and nokval[0, 0] != nokval[0, 1]:
-                #     # breakpoint()
-                #     prediction_consistencies.append(tokens_generated)
+        # Decode the prompt for logging
+        try:
+            prompt_text = tokenizer.decode(batch[0], skip_special_tokens=True)
+        except:
+            prompt_text = f"Prompt {prompt_num} (could not decode)"
+            
+        while(tokens_generated<tokens_to_generate):
+            print(f"--- Generation step {tokens_generated + 1} ---")
+            # print("-------no_kv_evaluate--------:")
+            if not no_kv_stop:
+                base_logits_no_kv, next_token_no_kv, accepted_preds, no_kv_stop = no_kv_evaluate(dataloader, no_kv_model, batch, no_kv_predictions, no_kv_tokens, tokens_to_generate, accepted_preds)
+                if no_kv_stop:
+                    print(f"🚫 no_kv stopped at step {tokens_generated + 1}")
+
+            # print("------kv_evaluate--------:")
+            if not kv_stop:
+                next_logits, next_token_kv, accepted_head_idx, kv_stop = kv_evaluate(dataloader, kv_model, batch, kv_predictions, kv_tokens, accepted_heads, accelerated_predictions, tokens_to_generate, next_token_kv)
+                if kv_stop:
+                    print(f"🚫 kv stopped at step {tokens_generated + 1}")
+
+            tokens_generated += 1
+            
+            # Break the loop if both models have stopped
+            if kv_stop and no_kv_stop:
+                print(f"Both models have stopped, ending generation at token {tokens_generated}")
                 break
-                # else:
-                #     break
-            # else:
-            #     print("Same!")
         kv_predictions_str = ''.join(kv_predictions)
         no_kv_predictions_str = ''.join(no_kv_predictions)
         print('------------------------------')
@@ -683,27 +882,85 @@ def run():
         diff, kv_index, no_kv_index = first_diff_index(kv_predictions, no_kv_predictions)
         if isinstance(no_kv_index, int): 
             diff_list.append(no_kv_index)
-        print("Difference starts from:", no_kv_index)
+        print("Difference starts from:", no_kv_index, " out of ", len(no_kv_predictions))
         print('accepted_heads till divergence:', accepted_heads[:kv_index-1])
-        avg_head_acceptance = (sum(accepted_heads[:kv_index-1])/len(accepted_heads[:kv_index-1]))
+        avg_head_acceptance = (sum(accepted_heads[:kv_index-1])/len(accepted_heads[:kv_index-1])) if len(accepted_heads[:kv_index-1])!=0 else 0
+
         print('avg accepted_heads upon divergence:', )
         avg_acceleration.append(1+avg_head_acceptance)
-        preds = {"kv_predictions:", kv_predictions_str, "no_kv_predictions:", no_kv_predictions_str}
+        preds = {"medusa:", kv_predictions_str, "no medusa:", no_kv_predictions_str}
         outputs.append(preds)
-        # p_log = F.log_softmax(pred_kv, dim=-1)
-        # q_log = F.log_softmax(pred_no_kv, dim=-1)
-        # kl = torch.sum(torch.exp(p_log) * (p_log - q_log))  # KL(p || q)
-        # print("pred_kv, pred_no_kv, kl norm:", kl)
         tokens_generated = 0
         accepted_preds = None
         next_token_kv = None
-        i+=1
-        if i>=20:
+        prompt_num+=1
+        value_avg_acceleration = sum(avg_acceleration)/len(avg_acceleration)
+
+        # logging
+        kv_predictions_str, kv_tokens, no_kv_tokens, no_kv_predictions_str
+        avg_acceleration, value_avg_acceleration, accelerated_predictions
+        print("Difference starts from:", no_kv_index, " out of ", len(no_kv_predictions))
+        
+        # Get stop token information
+        kv_stop_token = None
+        no_kv_stop_token = None
+        
+        if kv_stop and kv_tokens:
+            # Get the last token that caused KV model to stop
+            last_kv_token = kv_tokens[-1]
+            if isinstance(last_kv_token, torch.Tensor):
+                kv_stop_token = last_kv_token.item() if last_kv_token.numel() == 1 else last_kv_token.flatten()[-1].item()
+            else:
+                kv_stop_token = last_kv_token
+                
+        if no_kv_stop and no_kv_tokens:
+            # Get the last token that caused no-KV model to stop
+            last_no_kv_token = no_kv_tokens[-1]
+            if isinstance(last_no_kv_token, torch.Tensor):
+                no_kv_stop_token = last_no_kv_token.item() if last_no_kv_token.numel() == 1 else last_no_kv_token.flatten()[-1].item()
+            else:
+                no_kv_stop_token = last_no_kv_token
+        
+        # Log results for this prompt
+        log_evaluation_results(
+            prompt_num=prompt_num,
+            prompt_text=prompt_text,
+            kv_predictions_str=kv_predictions_str,
+            no_kv_predictions_str=no_kv_predictions_str,
+            kv_tokens=kv_tokens,
+            no_kv_tokens=no_kv_tokens,
+            avg_acceleration=avg_acceleration,
+            value_avg_acceleration=value_avg_acceleration,
+            accelerated_predictions=accelerated_predictions,
+            diff_list=diff_list,
+            accepted_heads=accepted_heads,
+            kv_index=kv_index,
+            no_kv_index=no_kv_index,
+            avg_head_acceptance=avg_head_acceptance,
+            tokens_generated=tokens_generated,
+            kv_stop=kv_stop,
+            no_kv_stop=no_kv_stop,
+            kv_stop_token=kv_stop_token,
+            no_kv_stop_token=no_kv_stop_token
+        )
+        
+        if prompt_num>=num_prompts:
+        
             print('------------------------------')
-            print("prediction_consistencies: ", prediction_consistencies)
+            value_avg_acceleration = sum(avg_acceleration)/len(avg_acceleration)
+            print('avg_acceleration:', avg_acceleration)
+            print('value_avg_acceleration:', value_avg_acceleration)
             print("accelerated_predictions:", accelerated_predictions)
+
             breakpoint()
-    # print(diff_list)
+
+    # print('------------------------------')
+    # value_avg_acceleration = sum(avg_acceleration)/len(avg_acceleration)
+    # print('avg_acceleration:', avg_acceleration)
+    # print('value_avg_acceleration:', value_avg_acceleration)
+    # print("accelerated_predictions:", accelerated_predictions)
+
+        
 
 if __name__ == "__main__":
     # Set environment variable for deterministic CuBLAS operations
@@ -729,11 +986,11 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
 
-    tokens_to_generate = 100
+    tokens_to_generate = 200
 
     dataloader = load_data(dataset_dir, tokenizer_dir, bs = 1)
     # checkpoint_dir = None
-
+    num_prompts = 20
     model = load_model(checkpoint_dir)
     # no_kv_predictions = []
     # kv_predictions = []
