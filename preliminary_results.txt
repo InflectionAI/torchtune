@@ -1,0 +1,25 @@
+kv_predictions: 
+
+Abraham Lincoln, the 16th President of the United States, had to deal with numerous factions during his presidency, which spanned from 1861 to 1865. Here's a list of some of the key factions he encountered, along with their relationship to him:
+
+**Allies:**
+
+1. **The Republican Party**: Lincoln was a member of the Republican Party, which was a coalition of anti-slavery activists, Whigs, and Free Soilers. He was the party's leader and relied on its support to pass his policies.
+2. **The Radical Republicans**: A faction within the Republican Party, the Radicals were a group of abolitionists who wanted to end slavery immediately
+------------------------------
+no_kv_predictions: 
+
+Abraham Lincoln, the 16th President of the United States, had to deal with numerous factions during his presidency, which spanned from 1861 to 1865. Here's a list of some of the key factions he encountered, along with their relationship to him:
+
+**Allies:**
+
+1. **The Republican Party**: Lincoln was a member of the Republican Party, which was a coalition of anti-slavery activists, Whigs, and Free Soilers. He was the party
+------------------------------
+Difference starts from: 98
+accepted_heads till divergence: [0, 4, 3, 3, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 2, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 2, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0]
+avg accepted_heads upon divergence:
+------------------------------
+avg_acceleration:  [1.0, 1.4696969696969697, 1.3857142857142857, 1.2933333333333334, 1.4696969696969697, 1.4696969696969697, 1.4696969696969697, 1.4696969696969697, 1.3768115942028984, 1.4696969696969697, 1.6724137931034484, 1.2763157894736843, 1.3661971830985915, 1.4696969696969697, 1.4696969696969697, 1.2933333333333334, 1.2125, 1.2258064516129032, 1.4696969696969697, 1.476923076923077]
+> <string>(24)run()
+(Pdb) sum(avg_acceleration)/len(avg_acceleration)
+1.390331078403414

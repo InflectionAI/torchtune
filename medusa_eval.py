@@ -25,7 +25,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
-import sys, pdb, traceback; sys.excepthook = lambda t, v, tb: (traceback.print_exception(t, v, tb), pdb.post_mortem(tb))
+# import sys, pdb, traceback; sys.excepthook = lambda t, v, tb: (traceback.print_exception(t, v, tb), pdb.post_mortem(tb))
 
 # Force SDPA math kernel to reduce numeric drift across paths
 def sdp_math_context():
@@ -354,6 +354,9 @@ def no_kv_evaluate(dataloader, model, batch, no_kv_predictions, tokens_to_genera
         #     return base_logits
         next_token = base_logits.argmax(dim=-1, keepdim=True)  # [bs, 1]
         accepted_preds = torch.cat([accepted_preds, next_token], dim=-1)
+        # Appending next token to list of predicted tokens
+        decoded = decode(next_token)
+        no_kv_predictions.append(decoded)
     else:
         # while tokens_generated < tokens_to_generate:
         # torch.cuda.empty_cache() 
@@ -420,7 +423,7 @@ def get_medusa_preds(output, first_decode = False):
     medusa_preds = medusa_logits.argmax(dim = -1) # shape: [bs, seq_len, n] or [bs, 1, n] for first_decode
     return medusa_preds, medusa_logits
     
-def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5, input_token = None):
+def kv_evaluate(dataloader, model, batch, kv_predictions, accepted_heads, accelerated_predictions, tokens_to_generate = 5, input_token = None):
     '''Eval using kv caching'''
     layer = get_attn_layer(model)
     model_dtype = get_model_dtype(model)
@@ -460,7 +463,7 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         kv_predictions.append(decoded_prediction)
         
         combined_preds = torch.cat((next_token, medusa_preds), dim = 1) # shape: [bs, 1+n]
-        combined_logits = torch.cat((base_logits, medusa_logits), dim = 1)
+        combined_logits = torch.cat((base_logits, medusa_logits), dim = 1) # shape: [bs, 1+n, vocab_dim]
 
         # update kv cache
         curr_kv_len = curr_seq_len
@@ -501,6 +504,10 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         correct_pred_mask = mask.cumprod(dim=1)
         last_accepted_head = correct_pred_mask.sum().item()
         
+        accepted_heads.append(last_accepted_head)
+        # debug
+        # last_accepted_head = 0
+
         print("prev_preds:", prev_preds, decode(prev_preds))
         print("base_tokens:", base_tokens, decode(base_tokens))
         print("mask:", mask)
@@ -511,6 +518,7 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         # (the base token + the accepted medusa tokens)
         accepted_tokens_count = last_accepted_head + 1
         
+
         # Update KV cache length
         curr_kv_len += accepted_tokens_count
         
@@ -519,11 +527,18 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         print('cache len before:', layer.attn.kv_cache.size)
         model.revert_cache_to_valid_length(curr_kv_len)
         print('cache len after:', layer.attn.kv_cache.size)
+        assert(layer.attn.kv_cache.size == curr_kv_len)
         
+        accepted_preds = base_tokens[:, :last_accepted_head+1].unsqueeze(-1)  # shape: [bs, 1]
         # Prepare next input: base token + medusa predictions for next iteration
         base_token = base_tokens[:, last_accepted_head].unsqueeze(-1)  # shape: [bs, 1]
         medusa_tokens = medusa_preds[:, last_accepted_head]  # shape: [bs, n]
         
+        # Analyze the accepted tokens
+        if last_accepted_head>0:
+            accelerated_tokens = base_tokens[:, 1:last_accepted_head+1].unsqueeze(-1)
+            accelerated_prediction = decode(accelerated_tokens)
+            accelerated_predictions.append(accelerated_prediction)
         next_tokens = torch.cat((base_token, medusa_tokens), dim=-1)  # shape: [bs, 1+n]
         next_logits = torch.cat((
             base_logits[:, last_accepted_head].unsqueeze(1), 
@@ -531,7 +546,7 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
         ), dim=-2)
         
         # Decode and store the accepted base token
-        decoded_prediction = decode(base_token)
+        decoded_prediction = decode(accepted_preds)
         kv_predictions.append(decoded_prediction)
         
         print("-----------------------------------------------------")
@@ -544,12 +559,26 @@ def kv_evaluate(dataloader, model, batch, kv_predictions, tokens_to_generate = 5
     print("Accepted token IDs:", accepted_tokens_list)
     return accepted_tokens_list
 
-def first_diff_index(s1, s2):
-    for i, (a, b) in enumerate(zip(s1, s2)):
-        if a != b:
+def find_index_in_list(target_index, predlist):
+    index_sum = 0
+    for i, elem in enumerate(predlist):
+        index_sum += len(elem)
+        if index_sum>target_index:
+            return i-1
+        if index_sum == target_index:
             return i
-    if len(s1) != len(s2):
-        return min(len(s1), len(s2))  # one is a prefix of the other
+    return None
+
+def first_diff_index(kv_pred, no_kv_pred):
+    kv_str = ''.join(kv_pred)
+    no_kv_str = ''.join(no_kv_pred)
+    for i, (a, b) in enumerate(zip(kv_str, no_kv_str)):
+        # if they diverge
+        if a != b:
+            break
+    kv_index = find_index_in_list(i, kv_pred)
+    no_kv_index = find_index_in_list(i, no_kv_pred)
+    return i, kv_index, no_kv_index
     return "They're exactly same!"  # strings are identical
 
 
@@ -593,6 +622,8 @@ def run():
     model_dtype = next(kv_model.parameters()).dtype
     i = 0
     prediction_consistencies = []
+    avg_acceleration = []
+    outputs = []
     for batch in dataloader:
     #     batch = torch.tensor([[128000, 128006,   9125, 128007,    271,    791,   3823,    374,   2663,
     #   21077,    323,    279,    892,    374,   7418,     11,   6250,    220,
@@ -604,7 +635,7 @@ def run():
         tokens_generated = 0
         accepted_preds = None
         next_token_kv = None
-        no_kv_predictions = []; kv_predictions = []
+        no_kv_predictions = []; kv_predictions = []; accepted_heads = []; accelerated_predictions = []
         while(tokens_generated<tokens_to_generate):
             # print("-------no_kv_evaluate--------:")
             # pred_no_kv = no_kv_evaluate(dataloader, no_kv_model, batch, tokens_to_generate)
@@ -612,15 +643,14 @@ def run():
             # print("------kv_evaluate--------:")
             
             # pred_kv = kv_evaluate(dataloader, kv_model, batch, tokens_to_generate)
-            # breakpoint()
-            next_logits, next_token_kv, accepted_head_idx = kv_evaluate(dataloader, kv_model, batch, kv_predictions, tokens_to_generate, next_token_kv)
+            next_logits, next_token_kv, accepted_head_idx = kv_evaluate(dataloader, kv_model, batch, kv_predictions, accepted_heads, accelerated_predictions, tokens_to_generate, next_token_kv)
             
             # Fix: increment by the number of accepted tokens (base + accepted medusa heads)
-            if accepted_head_idx is not None:
-                tokens_generated += (accepted_head_idx + 1)
-            else:
-                tokens_generated += 1
-                
+            # if accepted_head_idx is not None:
+            #     tokens_generated += (accepted_head_idx + 1)
+            # else:
+            #     tokens_generated += 1
+            tokens_generated +=1
             continue
         
             if next_token_no_kv != next_token_kv:
@@ -642,18 +672,24 @@ def run():
                 #     break
             # else:
             #     print("Same!")
+        kv_predictions_str = ''.join(kv_predictions)
+        no_kv_predictions_str = ''.join(no_kv_predictions)
+        print('------------------------------')
+        print("kv_predictions:", kv_predictions_str)
+        print('------------------------------')
+        print("no_kv_predictions:", no_kv_predictions_str)
+        print('------------------------------')
 
-        print('------------------------------')
-        print("kv_predictions:", ''.join(kv_predictions))
-        print('------------------------------')
-        print("no_kv_predictions:", ''.join(no_kv_predictions))
-        print('------------------------------')
-        break
-        # diff = first_diff_index(pred_no_kv, pred_kv)
-        # if isinstance(diff, int): 
-        #     diff_list.append(diff)
-        # print("Difference starts from:", diff)
-
+        diff, kv_index, no_kv_index = first_diff_index(kv_predictions, no_kv_predictions)
+        if isinstance(no_kv_index, int): 
+            diff_list.append(no_kv_index)
+        print("Difference starts from:", no_kv_index)
+        print('accepted_heads till divergence:', accepted_heads[:kv_index-1])
+        avg_head_acceptance = (sum(accepted_heads[:kv_index-1])/len(accepted_heads[:kv_index-1]))
+        print('avg accepted_heads upon divergence:', )
+        avg_acceleration.append(1+avg_head_acceptance)
+        preds = {"kv_predictions:", kv_predictions_str, "no_kv_predictions:", no_kv_predictions_str}
+        outputs.append(preds)
         # p_log = F.log_softmax(pred_kv, dim=-1)
         # q_log = F.log_softmax(pred_no_kv, dim=-1)
         # kl = torch.sum(torch.exp(p_log) * (p_log - q_log))  # KL(p || q)
@@ -665,8 +701,9 @@ def run():
         if i>=20:
             print('------------------------------')
             print("prediction_consistencies: ", prediction_consistencies)
-            break
-    print(diff_list)
+            print("accelerated_predictions:", accelerated_predictions)
+            breakpoint()
+    # print(diff_list)
 
 if __name__ == "__main__":
     # Set environment variable for deterministic CuBLAS operations
@@ -677,7 +714,7 @@ if __name__ == "__main__":
     tokenizer_dir = '/home/ubuntu/.llama/checkpoints/Llama3.1-8B-Instruct/tokenizer.model'
     # checkpoint_dir = '/home/ubuntu/vanshaj/inf2-training/3rdparty/torchtune/medusa_checkpoints/epoch_0/'
     checkpoint_dir = '/home/ubuntu/vanshaj/torchtune/medusa_sharegpt_val_checkpoints/epoch_2000046/'
-    dataset_dir = '/home/ubuntu/vanshaj/justpi.jsonl'
+    # dataset_dir = '/home/ubuntu/vanshaj/justpi.jsonl'
     dataset_dir = 'sharegpt_60k_full.jsonl'
     torch.cuda.empty_cache()
     device = torch.device('cuda:1')
