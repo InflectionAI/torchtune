@@ -44,7 +44,7 @@ def load_data(dataset_dir, tokenizer_dir, bs = 1):
     )
     return dataloader, tokenizer
     
-def load_model(checkpoint_dir, device, debug = False):
+def load_model(checkpoint_dir, device, max_cache_size, debug = False):
     if checkpoint_dir == None:
         return
     with init_empty_weights():
@@ -98,5 +98,5 @@ def setup():
 
     dataloader, tokenizer = load_data(dataset_dir, tokenizer_dir, bs = 1)
     num_prompts = 20
-    model = load_model(checkpoint_dir, device, debug)
+    model = load_model(checkpoint_dir, device, max_cache_size, debug)
     return model, dataloader, tokenizer

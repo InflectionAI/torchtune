@@ -1,7 +1,17 @@
 import torch
 import torch.nn.functional as F
+from torchtune.modules import TransformerSelfAttentionLayer
+from contextlib import nullcontext
 
 TOPK=10 # topk for sparse tree (10 is a placeholder and it is sufficient)
+
+def sdp_math_context():
+    try:
+        from torch.nn.attention import sdpa_kernel
+        return sdpa_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+    except Exception:
+        return nullcontext()
+
 
 def pad_path(path, length, pad_value=-2):
     """
@@ -505,7 +515,8 @@ def tree_decoding(
 
     causal_mask = get_medusa_mask(model, input_ids)
     # I'm using their position_ids because they should work out of the box
-    output = model(tree_candidates, mask=causal_mask, input_pos=position_ids)
+    with sdp_math_context():
+        output = model(tree_candidates, mask=causal_mask, input_pos=position_ids)
     tree_logits = output[0]
     vocab_dim = tree_logits.shape[-1]
     tree_medusa_logits = output[1:]
