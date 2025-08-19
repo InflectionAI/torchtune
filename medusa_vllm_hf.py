@@ -181,7 +181,8 @@ with torch.inference_mode():
 
         if tokenizer.eos_token_id in pred_base:
             break
-print('Average accept length:', sum(accept_lengths)/len(accept_lengths))
+avg_accept_len = sum(accept_lengths)/len(accept_lengths)
+print('Average accept length:', avg_accept_len)
 print(f"\n[Rank {world_group.rank}] Final text:\n{tokenizer.decode(accepted_candidates, skip_special_tokens=False)}")
 
 # --- CLEANUP ---
