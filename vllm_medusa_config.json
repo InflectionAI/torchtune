@@ -1,0 +1,16 @@
+{
+  "architectures": [
+    "MedusaForCausalLM"
+  ],
+  "model_type": "medusa",
+  "num_heads": 5,
+  "num_hidden_layers": 3,
+  "hidden_size": 4096,
+  "vocab_size": 128256,
+  "truncated_vocab_size": 128256,
+  "medusa_fc_bias": false,
+  "logit_scale": 1.0,
+  "original_lm_head": false,
+  "torch_dtype": "float16",
+  "vllm_resblock_layers": 2
+}
