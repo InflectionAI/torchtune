@@ -1,0 +1,14 @@
+curl -sS http://127.0.0.1:8002/v1/completions -H 'Content-Type: application/json' -d '{"model":"meta-llama/Meta-Llama-3.1-8B-Instruct","prompt":"Say hello in one short sentence.","max_tokens":16,"temperature":0}' | jq '.speculative_decoding_metrics' | cat
+{
+  "draft_acceptance_rate_percent": 7.2727272727272725,
+  "mean_acceptance_length": 1.3636363636363638,
+  "accepted": 4,
+  "drafted": 55,
+  "per_position_acceptance_rate": [
+    0.2727272727272727,
+    0.09090909090909091,
+    0,
+    0,
+    0
+  ]
+}
