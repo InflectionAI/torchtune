@@ -171,19 +171,22 @@ def adapt_resblock_weights(original_weight: torch.Tensor, target_layers: int) ->
     Returns:
         List of adapted weights for each layer
     """
-    # For now, we'll duplicate the weight across layers
-    # This is a simple approach - you might want to implement more sophisticated weight adaptation
+    print(f"    Adapting ResBlock weights: {original_weight.shape} -> {target_layers} layers")
+    
     adapted_weights = []
     
     for i in range(target_layers):
         if i == 0:
-            # First layer gets the original weight
+            # First layer gets the original weight (this is the main transformation)
             adapted_weights.append(original_weight.clone())
         else:
             # Subsequent layers get a scaled version to avoid exact duplication
-            # You might want to implement more sophisticated initialization here
-            scaled_weight = original_weight * (0.1 ** i)  # Decay factor
+            # This is important because vLLM's ResidualBlock applies multiple transformations
+            # We use a smaller scale factor to maintain the residual connection behavior
+            scale_factor = 0.5 ** i  # More conservative scaling
+            scaled_weight = original_weight * scale_factor
             adapted_weights.append(scaled_weight)
+            print(f"      Layer {i}: scaled by {scale_factor:.3f}")
     
     return adapted_weights
 
@@ -213,34 +216,72 @@ def convert_medusa_weights_advanced(state_dict: Dict[str, torch.Tensor], config:
     print(f"Final configuration: heads={medusa_num_heads}, layers={medusa_num_layers}, hidden_size={hidden_size}, vocab_size={vocab_size}")
     print(f"vLLM ResidualBlock layers: {vllm_resblock_layers}")
     
+    print("\n🔍 Analyzing weight structure...")
+    print("Available MedusaHeads weights:")
+    for key in sorted(medusa_weights.keys()):
+        print(f"  {key}: {medusa_weights[key].shape}")
+    
     # Convert weights for each head
     for head_idx in range(medusa_num_heads):
-        # Convert residual blocks
+        print(f"\n🔄 Converting Head {head_idx}:")
+        
+        # Convert residual blocks - TorchTune has sequential ResBlocks
+        # We need to stack them sequentially for vLLM's ResidualBlock
+        head_resblock_weights = []
+        
         for layer_idx in range(medusa_num_layers):
-            # Convert ResBlock weights to ResidualBlock format
+            # TorchTune: medusa_heads.medusa_base.{head_idx}.{layer_idx}.linear.weight
             old_key = f"medusa_heads.medusa_base.{head_idx}.{layer_idx}.linear.weight"
             
             if old_key in medusa_weights:
                 original_weight = medusa_weights[old_key]
-                adapted_weights = adapt_resblock_weights(original_weight, vllm_resblock_layers)
+                print(f"  Found ResBlock {layer_idx}: {original_weight.shape}")
+                head_resblock_weights.append(original_weight)
+            else:
+                print(f"  ⚠️  Missing weight for {old_key}")
+        
+        # Now stack the ResBlock weights for this head
+        if head_resblock_weights:
+            print(f"  Stacking {len(head_resblock_weights)} ResBlocks for vLLM ResidualBlock")
+            
+            # TorchTune: Sequential ResBlocks (3 layers)
+            # vLLM: ResidualBlock with 2 layers
+            # Strategy: Combine the sequential processing into vLLM's format
+            
+            if len(head_resblock_weights) == 3 and vllm_resblock_layers == 2:
+                # Combine 3 ResBlocks into 2 vLLM layers
+                # Layer 0: Combine ResBlock 0 and 1
+                # Layer 1: Use ResBlock 2
                 
-                # Assign adapted weights to vLLM format
+                # First vLLM layer: combine first two ResBlocks
+                combined_weight_0 = head_resblock_weights[0] + head_resblock_weights[1] * 0.5
+                converted_weights[f"blocks.{head_idx}.layers.0.weight"] = combined_weight_0
+                print(f"    -> blocks.{head_idx}.layers.0.weight: {combined_weight_0.shape} (ResBlock 0+1 combined)")
+                
+                # Second vLLM layer: use third ResBlock
+                converted_weights[f"blocks.{head_idx}.layers.1.weight"] = head_resblock_weights[2]
+                print(f"    -> blocks.{head_idx}.layers.1.weight: {head_resblock_weights[2].shape} (ResBlock 2)")
+                
+            else:
+                # Fallback: use first ResBlock and scale others
+                main_weight = head_resblock_weights[0]
+                adapted_weights = adapt_resblock_weights(main_weight, vllm_resblock_layers)
+                
                 for vllm_layer_idx, adapted_weight in enumerate(adapted_weights):
                     new_key = f"blocks.{head_idx}.layers.{vllm_layer_idx}.weight"
                     converted_weights[new_key] = adapted_weight
-                    print(f"Converted: {old_key} -> {new_key} (adapted for {vllm_resblock_layers} layers)")
-            else:
-                print(f"Warning: Missing weight for {old_key}")
+                    print(f"    -> {new_key}: {adapted_weight.shape}")
         
-        # Convert linear layer weights
+        # Convert linear layer weights (LM heads)
         old_key = f"medusa_heads.medusa_linear_layers.{head_idx}.weight"
         new_key = f"lm_heads.{head_idx}.weight"
         
         if old_key in medusa_weights:
             converted_weights[new_key] = medusa_weights[old_key]
-            print(f"Converted: {old_key} -> {new_key}")
+            print(f"  Found LM head: {medusa_weights[old_key].shape}")
+            print(f"    -> {new_key}: {medusa_weights[old_key].shape}")
         else:
-            print(f"Warning: Missing weight for {old_key}")
+            print(f"  ⚠️  Missing weight for {old_key}")
     
     # Add configuration attributes that vLLM expects
     converted_weights['config'] = {
@@ -254,7 +295,12 @@ def convert_medusa_weights_advanced(state_dict: Dict[str, torch.Tensor], config:
         'original_lm_head': False
     }
     
-    print(f"Successfully converted {len(converted_weights)} weights")
+    print(f"\n✅ Successfully converted {len(converted_weights)} weights")
+    print("Converted weight mapping:")
+    for key in sorted(converted_weights.keys()):
+        if key != 'config':
+            print(f"  {key}: {converted_weights[key].shape}")
+    
     return converted_weights
 
 
@@ -263,6 +309,7 @@ def create_vllm_config_advanced(config: Dict[str, Any], output_config_path: str)
     print(f"Creating advanced vLLM config at: {output_config_path}")
     
     # Use the extracted config values that were auto-detected from weights
+    # These should take precedence over any default values
     vllm_config = {
         "architectures": ["MedusaForCausalLM"],
         "model_type": "medusa",
@@ -278,11 +325,18 @@ def create_vllm_config_advanced(config: Dict[str, Any], output_config_path: str)
         "vllm_resblock_layers": config.get('vllm_resblock_layers', 2)
     }
     
+    # Print the actual values being used
+    print(f"Config values from weights:")
+    print(f"  medusa_num_heads: {config.get('medusa_num_heads', 'NOT_FOUND')}")
+    print(f"  medusa_num_layers: {config.get('medusa_num_layers', 'NOT_FOUND')}")
+    print(f"  hidden_size: {config.get('hidden_size', 'NOT_FOUND')}")
+    print(f"  vocab_size: {config.get('vocab_size', 'NOT_FOUND')}")
+    
     with open(output_config_path, 'w') as f:
         json.dump(vllm_config, f, indent=2)
     
     print("Advanced vLLM config created successfully!")
-    print(f"Config created with: {vllm_config['num_heads']} heads, {vllm_config['num_hidden_layers']} layers, hidden_size={vllm_config['hidden_size']}, vocab_size={vllm_config['vocab_size']}")
+    print(f"Final config: {vllm_config['num_heads']} heads, {vllm_config['num_hidden_layers']} layers, hidden_size={vllm_config['hidden_size']}, vocab_size={vllm_config['vocab_size']}")
 
 
 def main():
@@ -316,7 +370,21 @@ def main():
     
     # Create vLLM config if requested
     if args.output_config:
-        create_vllm_config_advanced(checkpoint_config, args.output_config)
+        # Get the extracted config from the conversion process
+        # We need to re-run the extraction to get the config
+        medusa_weights, extracted_config = extract_medusa_heads_weights(state_dict)
+        
+        # Merge with checkpoint config
+        final_config = checkpoint_config.copy()
+        final_config.update(extracted_config)
+        
+        print(f"\n📋 Final config for vLLM config file:")
+        print(f"  medusa_num_heads: {final_config.get('medusa_num_heads')}")
+        print(f"  medusa_num_layers: {final_config.get('medusa_num_layers')}")
+        print(f"  hidden_size: {final_config.get('hidden_size')}")
+        print(f"  vocab_size: {final_config.get('vocab_size')}")
+        
+        create_vllm_config_advanced(final_config, args.output_config)
     
     print("\nAdvanced conversion completed successfully!")
     print(f"Converted checkpoint: {args.output_checkpoint}")
