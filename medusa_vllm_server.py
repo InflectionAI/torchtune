@@ -13,7 +13,7 @@ Usage examples:
     --enforce-eager \
     --host 0.0.0.0 \
     --port 8000 \
-    --medusa-checkpoint ./vllm_medusa_model/vllm_medusa_heads_final.pt \
+    --medusa-checkpoint ./vllm_medusa_model \
     --medusa-num-speculative-tokens 5
 
 Notes:
@@ -21,6 +21,9 @@ Notes:
    engine overrides are used; we only supply SpeculativeConfig(method="medusa").
  - You can also provide the Medusa checkpoint path via the MEDUSA_CHECKPOINT
    environment variable.
+ - Automatically uses CUDA device 1 (GPU 1) to avoid conflicts with base model.
+ - Runs on port 8000 (Medusa server).
+ - Deterministic decoding is automatically enforced (top_k=1, temperature=0.0).
 """
 
 import os
@@ -57,7 +60,7 @@ def build_args(argv: list[str]) -> Namespace:
         "--medusa-checkpoint",
         type=str,
         default=os.environ.get(
-            "MEDUSA_CHECKPOINT", "./vllm_medusa_model/vllm_medusa_heads_final.pt"
+            "MEDUSA_CHECKPOINT", "./vllm_medusa_model"
         ),
         help=(
             "Path to Medusa weights (.pt) or directory containing them. "
@@ -84,11 +87,18 @@ def build_args(argv: list[str]) -> Namespace:
         "model": args.medusa_checkpoint,
         "num_speculative_tokens": args.medusa_num_speculative_tokens,
     }
+    
+    # Set deterministic decoding parameters
+    args.top_k = 1
+    args.temperature = 0.0
 
     return args
 
 
 def main() -> None:
+    # Set CUDA device to GPU 1 by default for Medusa server
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    
     # If users prefer V0 explicitly, they can set VLLM_USE_V1=0 in env.
     # Both V0 and V1 support Medusa; we leave the oracle to choose by default.
     args = build_args(sys.argv[1:])
