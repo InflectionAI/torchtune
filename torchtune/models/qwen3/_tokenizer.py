@@ -20,6 +20,7 @@ QWEN3_SPECIAL_TOKENS = {
     "</tool_response>": 151666,
     "<think>": 151667,
     "</think>": 151668,
+    "<SESSION END>": 151669,
 }
 
 

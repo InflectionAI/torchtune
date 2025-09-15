@@ -1134,6 +1134,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     and self.global_step % self._run_val_every_n_steps == 0
                 ):
                     pbar.refresh()
+                    print(f"Running validation at step {self.global_step}")
                     self.validate()
 
             self.epochs_run += 1

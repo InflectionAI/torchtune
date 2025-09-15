@@ -24,6 +24,7 @@ class MaskingStrategy(Enum):
     TRAIN_ON_ALL = "train_on_all"
     TRAIN_ON_ASSISTANT = "train_on_assistant"
     TRAIN_ON_LAST = "train_on_last"
+    TRAIN_ON_USER = "train_on_user"
 
 
 class Message:
@@ -852,6 +853,7 @@ class AlpacaToMessages(Transform):
         return {"messages": messages}
 
 
+# TODO: edit for user simulator
 def validate_messages(
     messages: list[Message],
 ) -> None:
@@ -909,11 +911,12 @@ def mask_messages(messages: list[Message], masking_strategy: MaskingStrategy) ->
     Args:
         messages (list[Message]): a list of messages to mask.
         masking_strategy (MaskingStrategy): masking strategy to use.
-            Must be one of `train_on_all`, `train_on_assistant`, `train_on_last`.
+            Must be one of `train_on_all`, `train_on_assistant`, `train_on_last`, `train_on_user`.
 
             - ``train_on_all``: both user and assistant messages are unmasked
             - ``train_on_assistant``: user messages are masked, only assistant messages are unmasked
             - ``train_on_last``: only the last assistant message is unmasked
+            - ``train_on_user``: assistant messages are masked, only user messages are unmasked
     """
     masking_strategy = MaskingStrategy(masking_strategy)
     marked_last_assistant_message = False
@@ -933,3 +936,5 @@ def mask_messages(messages: list[Message], masking_strategy: MaskingStrategy) ->
             message.masked = message.role == "user" and message.contains_media
         elif masking_strategy == MaskingStrategy.TRAIN_ON_ASSISTANT:
             message.masked = message.role != "assistant"
+        elif masking_strategy == MaskingStrategy.TRAIN_ON_USER:
+            message.masked = message.role != "user"

@@ -1,0 +1,143 @@
+# Config for multi-device full finetuning in full_finetune_distributed.py
+# using a Qwen3 4B model for USER SIMULATOR training
+#
+# This config is specifically designed for training a user simulator model that:
+# - Trains on user messages instead of assistant messages
+# - Handles session-based conversation data with <SESSION END> tokens
+# - Uses the custom user simulator dataset transform
+#
+# To launch on 2 devices, run the following command from root:
+#   tune run --nnodes 1 --nproc_per_node 2 full_finetune_distributed --config qwen3/4B_user
+#
+# You can add specific overrides through the command line. For example
+# to override the checkpointer directory while launching training:
+#   tune run --nnodes 1 --nproc_per_node 2 full_finetune_distributed --config qwen3/4B_user checkpointer.checkpoint_dir=<YOUR_CHECKPOINT_DIR>
+#
+# This config works best when the model is being fine-tuned on 2+ GPUs.
+# Single device full finetuning requires more memory optimizations.
+
+output_dir: /mnt/vast/home/albert/inf2-training/outputs/user_simulator_qwen3_4B
+
+# Tokenizer (with SESSION END token support)
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: /mnt/vast/share/inf2-training/models/open_source/Qwen3-4B/vocab.json
+  merges_file: /mnt/vast/share/inf2-training/models/open_source/Qwen3-4B/merges.txt
+  max_seq_len: null
+
+# Dataset for user simulator training
+dataset:
+  _component_: inf2_training.torchtune_adapter.torchtune.datasets.user_simulator_dataset
+  source: json
+  data_files: /mnt/vast/prod/precooked/finetuning_tasks/full-sessions-20230712-web-humanlm-valid.jsonl
+  split: train
+  column_map:
+    prefix_text: prefix_text
+    text: text
+    has_next: has_next
+  new_system_prompt: "You are simulating a human user in a conversation with an AI assistant."
+  session_end_token: "<SESSION END>"
+  masking_strategy: train_on_user
+  #packed: False  # True increases speed
+seed: null
+shuffle: True
+
+# Validation
+run_val_every_n_steps: 100  # Change to an integer to enable validation every N steps
+dataset_val:
+  _component_: inf2_training.torchtune_adapter.torchtune.datasets.user_simulator_dataset
+  source: json
+  data_files: /mnt/vast/prod/precooked/finetuning_tasks/full-sessions-20230712-web-humanlm-valid.jsonl
+  split: train[:10%]
+  column_map:
+    prefix_text: prefix_text
+    text: text
+    has_next: has_next
+  new_system_prompt: "You are simulating a human user in a conversation with an AI assistant."
+  session_end_token: "<SESSION END>"
+  masking_strategy: train_on_user
+batch_size_val: 8
+
+# Model Arguments
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_instruct
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /mnt/vast/share/inf2-training/models/open_source/Qwen3-4B
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  # NOTE: this is necessary because Qwen3 4B is missing the lm_head.weight parameter on HF
+  # Other Qwen3 models contain two copies of the tied param, but Qwen3 4B does not
+  model_type: QWEN2
+resume_from_checkpoint: False
+
+# Fine-tuning arguments (adjusted for user simulator training)
+batch_size: 4
+epochs: 3
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  lr: 2e-5
+
+# Learning rate scheduler
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 100
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+max_steps_per_epoch: null
+gradient_accumulation_steps: 2  # Use to increase effective batch size
+clip_grad_norm: null
+compile: False  # torch.compile the model + loss, True increases speed + decreases memory
+optimizer_in_bwd: False  # True saves memory. Requires gradient_accumulation_steps=1
+
+# Training env
+device: cuda
+
+# Memory management
+enable_activation_checkpointing: True  # True reduces memory
+enable_activation_offloading: False  # True reduces memory
+
+# Reduced precision
+dtype: bf16
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+log_level: INFO  # DEBUG, WARN, etc.
+
+
+# Profiler (disabled)
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+
+  #Output directory of trace artifacts
+  output_dir: ${output_dir}/profiling_outputs
+
+  #`torch.profiler.ProfilerActivity` types to trace
+  cpu: True
+  cuda: True
+
+  #trace options passed to `torch.profiler.profile`
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+
+  # `torch.profiler.schedule` options:
+  # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

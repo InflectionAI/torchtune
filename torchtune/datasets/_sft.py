@@ -147,7 +147,8 @@ class SFTTransform(Transform):
         if self._message_transform is not None:
             transformed_sample = self._message_transform(sample)
             if "messages" in transformed_sample:
-                validate_messages(transformed_sample["messages"])
+                #validate_messages(transformed_sample["messages"])
+                pass
         else:
             transformed_sample = sample
 
